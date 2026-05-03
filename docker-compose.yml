@@ -1,0 +1,32 @@
+﻿services:
+  postgres:
+    image: postgres:16
+    container_name: triplets-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: triplets
+      POSTGRES_USER: triplets_user
+      POSTGRES_PASSWORD: triplets_pass
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - pgdata:/var/lib/postgresql/data
+
+  neo4j:
+    image: neo4j:5
+    container_name: triplets-neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/neo4jpass
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1g
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4jdata:/data
+
+volumes:
+  pgdata:
+  neo4jdata:
