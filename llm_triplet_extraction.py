@@ -5,7 +5,7 @@ from typing import List
 from pydantic import BaseModel, ConfigDict
 import time
 import streamlit as st
-from lemma_test import parse_csv, to_flat_csv
+from concat_headers import parse_csv, to_flat_csv
 import re
 
 class Triplet(BaseModel):
