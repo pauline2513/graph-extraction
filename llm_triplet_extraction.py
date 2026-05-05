@@ -187,10 +187,10 @@ def table_to_csv_text(table, sep: str = ";") -> str:
     write_header = not has_only_technical_headers(df)
     csv_text = df.to_csv(index=False, header=write_header, sep=sep)
 
-    headers, datarows = parse_csv(csv_text)
-    flat_csv = to_flat_csv(headers, datarows)
+    # headers, datarows = parse_csv(csv_text)
+    # flat_csv = to_flat_csv(headers, datarows)
 
-    lines = flat_csv.split("\n")
+    lines = csv_text.split("\n")
     lines[0] = re.sub(r"-\s+", "", lines[0])
     flat_csv = "\n".join(lines)
 

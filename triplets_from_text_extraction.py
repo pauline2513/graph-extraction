@@ -241,7 +241,6 @@ def find_triplets(sent, nouns, predicates):
                     obj for obj in head_objects
                     if can_share_candidate(head_predicate, predicate, obj, sent.words, subj_and_obj_for_predicate)
                 ]
-                print(shared)
                 subj_and_obj_for_predicate[predicate]["objects"] += shared
     
     for predicate in predicates:
@@ -382,12 +381,20 @@ def should_keep_child(child, role):
     return True
 
 
+def frame_node_text(word):
+    if not is_stanza_word(word):
+        return str(word)
+    if word.upos == "ADJ" or (word.upos == "VERB" and has_feat(word, "VerbForm", "Part")):
+        return word.text.lower()
+    return word.lemma
+
+
 def build_frame_tree(sent, root_word, role, blocked_ids=None, visited=None):
 
     if not is_stanza_word(root_word):
         if root_word in ("", None):
             return {"text": "", "frame": []}
-        return {"text": str(root_word.lemma), "frame": []}
+        return {"text": str(root_word), "frame": []}
 
     if blocked_ids is None:
         blocked_ids = set()
@@ -395,12 +402,12 @@ def build_frame_tree(sent, root_word, role, blocked_ids=None, visited=None):
         visited = set()
 
     if root_word.id in visited:
-        return {"text": root_word.lemma, "frame": []}
+        return {"text": frame_node_text(root_word), "frame": []}
 
     visited = visited | {root_word.id}
 
     node = {
-        "text": root_word.lemma,
+        "text": frame_node_text(root_word),
         "frame": []
     }
 
@@ -547,7 +554,7 @@ def normalize_slot(slot, slot_role):
         for t in inner_triplets
     )
     if all_structurally_empty:
-        if slot_role in ("subject", "object"):
+        if slot_role in ("subject", "predicate", "object"):
             anchor = inner_triplets[0]
             main_node = anchor.get("subject", {"text": "", "frame": []})
             if not node_is_empty(main_node):
@@ -608,19 +615,17 @@ def process_triplets(triplets, mode='separate'):
                     # }
                     new_triplet[role] = frames
                 else:
-                    new_triplet[role] = {"text": value["text"], "frame": []}
+                    new_triplet[role] = {"text": value["text"], "frame": value.get("frame", [])}
             res["triplets"].append(new_triplet)
         res = {"triplets":[normalize_outer_triplet(t) for t in res["triplets"]]}
     else:
         for triplet in triplets["triplets"]:
             triplets = [process_sentence(sent["text"])["triplets"] for sent in triplet.values()]
-            print(triplets)
             res["triplets"].extend(triplets[0])
             res["triplets"].extend(triplets[1])
             res["triplets"].extend(triplets[2])
     res_cleaned = {"triplets": []}
     for triplet in res["triplets"]:
-        print(triplet)
         if triplet["predicate"]["text"] == "":
             continue
         res_cleaned["triplets"].append(triplet)
