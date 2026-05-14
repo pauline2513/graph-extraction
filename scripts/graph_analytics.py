@@ -1,3 +1,4 @@
+import csv
 import hashlib
 import itertools
 import math
@@ -7,6 +8,7 @@ from collections import Counter
 from functools import lru_cache
 from importlib.util import find_spec
 from typing import Any
+import random
 
 import networkx as nx
 
@@ -52,6 +54,296 @@ def get_neo4j_driver(neo_cfg: dict[str, Any] | None = None):
 
 def normalize_text(value: str) -> str:
     return " ".join((value or "").lower().split()).strip()
+
+
+def canonical_match_text(value: Any) -> str:
+    text = normalize_text(str(value or "").replace('"', "").replace("\ufeff", ""))
+    text = text.replace("ё", "е")
+    text = re.sub(r"(?<=\d),(?=\d)", ".", text)
+    return text
+
+
+def canonical_contains(haystack: str, needle: str) -> bool:
+    haystack = canonical_match_text(haystack)
+    needle = canonical_match_text(needle)
+    return bool(needle) and (needle == haystack or needle in haystack)
+
+
+def detect_table_delimiter(filepath: str) -> str:
+    with open(filepath, "r", encoding="utf-8-sig", newline="") as f:
+        sample = f.read(4096)
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=";,\t")
+        return dialect.delimiter
+    except csv.Error:
+        counts = {delimiter: sample.count(delimiter) for delimiter in (";", ",", "\t")}
+        return max(counts, key=counts.get) if sample else ";"
+
+
+def read_table_csv(filepath: str, sep: str | None = None) -> list[list[str]]:
+    delimiter = sep or detect_table_delimiter(filepath)
+    with open(filepath, "r", encoding="utf-8-sig", newline="") as f:
+        return list(csv.reader(f, delimiter=delimiter, quotechar='"', skipinitialspace=True))
+
+
+def fix_decimal_commas(row: list[str], expected_len: int) -> list[str]:
+    row = list(row)
+    while len(row) > expected_len:
+        for i in range(1, len(row) - 1):
+            if re.fullmatch(r"[+-]?\d+", row[i].strip()) and re.fullmatch(r"\d+", row[i + 1].strip()):
+                row[i] = row[i].strip() + "," + row[i + 1].strip()
+                del row[i + 1]
+                break
+        else:
+            break
+    return row
+
+
+def table_cell_text(value: Any) -> str:
+    return " ".join(str(value or "").replace('"', "").split()).strip()
+
+
+def extract_ordinary_table_triplets(filepath: str) -> list[dict[str, Any]]:
+    rows = [row for row in read_table_csv(filepath) if any(table_cell_text(cell) for cell in row)]
+    if not rows:
+        return []
+
+    headers = [table_cell_text(cell) for cell in rows[0][1:]]
+    expected_len = len(headers) + 1
+    triplets: list[dict[str, Any]] = []
+    for row_idx, raw_row in enumerate(rows[1:], start=2):
+        row = fix_decimal_commas(raw_row, expected_len)
+        subject = table_cell_text(row[0] if row else "")
+        if not subject:
+            continue
+        values = row[1:]
+        for header, value in zip(headers, values):
+            predicate = table_cell_text(value)
+            obj = table_cell_text(header)
+            if not predicate and not obj:
+                continue
+            triplets.append(
+                {
+                    "table_file": os.path.basename(filepath),
+                    "table_type": "ordinary",
+                    "row_idx": row_idx,
+                    "subject": subject,
+                    "predicate": predicate,
+                    "object": obj,
+                }
+            )
+    return triplets
+
+
+def extract_name_value_horizontal_table_triplets(filepath: str) -> list[dict[str, Any]]:
+    rows = [row for row in read_table_csv(filepath) if any(table_cell_text(cell) for cell in row)]
+    if len(rows) < 2:
+        return []
+
+    headers = [table_cell_text(cell) for cell in rows[0]]
+    values = [table_cell_text(cell) for cell in rows[1]]
+    triplets: list[dict[str, Any]] = []
+    for idx, subject in enumerate(headers):
+        if not subject:
+            continue
+        predicate = values[idx] if idx < len(values) else ""
+        triplets.append(
+            {
+                "table_file": os.path.basename(filepath),
+                "table_type": "name_value_horizontal",
+                "row_idx": 2,
+                "subject": subject,
+                "predicate": predicate,
+                "object": "",
+            }
+        )
+    return triplets
+
+
+def extract_table_test_triplets(tables_dir: str) -> list[dict[str, Any]]:
+    if not tables_dir or not os.path.isdir(tables_dir):
+        return []
+
+    triplets: list[dict[str, Any]] = []
+    for filename in sorted(os.listdir(tables_dir)):
+        if not filename.lower().endswith(".csv"):
+            continue
+        filepath = os.path.join(tables_dir, filename)
+        if "1.7" in filename:
+            triplets.extend(extract_name_value_horizontal_table_triplets(filepath))
+        else:
+            triplets.extend(extract_ordinary_table_triplets(filepath))
+    return triplets
+
+
+def build_relation_match_index(rel_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    index_rows: list[dict[str, Any]] = []
+    for row in rel_rows:
+        if row.get("triplet_id") is None:
+            continue
+        index_rows.append(
+            {
+                "source_keys": {
+                    canonical_match_text(row.get("source_norm")),
+                    canonical_match_text(row.get("source_name")),
+                },
+                "target_keys": {
+                    canonical_match_text(row.get("target_norm")),
+                    canonical_match_text(row.get("target_name")),
+                },
+                "predicate_keys": {
+                    canonical_match_text(row.get("predicate_norm")),
+                    canonical_match_text(row.get("predicate")),
+                },
+                "source_name": row.get("source_name") or row.get("source_norm") or "",
+                "target_name": row.get("target_name") or row.get("target_norm") or "",
+                "predicate": row.get("predicate") or row.get("predicate_norm") or "",
+                "triplet_id": row.get("triplet_id"),
+                "document_id": row.get("document_id"),
+            }
+        )
+    return index_rows
+
+
+def build_triplet_match_index(triplet_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    index_rows: list[dict[str, Any]] = []
+    for row in triplet_rows:
+        frame_terms_by_role = row.get("frame_terms_by_role") or {}
+        index_rows.append(
+            {
+                "subject_keys": {
+                    canonical_match_text(row.get("subject")),
+                    canonical_match_text(row.get("subject_norm")),
+                },
+                "predicate_keys": {
+                    canonical_match_text(row.get("predicate")),
+                    canonical_match_text(row.get("predicate_norm")),
+                },
+                "object_keys": {
+                    canonical_match_text(row.get("object")),
+                    canonical_match_text(row.get("object_norm")),
+                },
+                "frame_terms_by_role": {
+                    role: {canonical_match_text(term) for term in terms if canonical_match_text(term)}
+                    for role, terms in frame_terms_by_role.items()
+                },
+                "subject": row.get("subject") or "",
+                "predicate": row.get("predicate") or "",
+                "object": row.get("object") or "",
+                "triplet_id": row.get("triplet_id"),
+                "document_id": row.get("document_id"),
+            }
+        )
+    return index_rows
+
+
+def slot_matches_keys(value: Any, keys: set[str], allow_contains: bool = False) -> bool:
+    needle = canonical_match_text(value)
+    if not needle:
+        return "" in keys
+    if needle in keys:
+        return True
+    return allow_contains and any(canonical_contains(key, needle) or canonical_contains(needle, key) for key in keys)
+
+
+def triplet_matches_direct(index_row: dict[str, Any], table_triplet: dict[str, Any]) -> bool:
+    return (
+        slot_matches_keys(table_triplet.get("subject"), index_row["subject_keys"])
+        and slot_matches_keys(table_triplet.get("predicate"), index_row["predicate_keys"])
+        and slot_matches_keys(table_triplet.get("object"), index_row["object_keys"])
+    )
+
+
+def triplet_matches_frame(index_row: dict[str, Any], table_triplet: dict[str, Any]) -> bool:
+    return (
+        slot_matches_keys(
+            table_triplet.get("subject"),
+            index_row["subject_keys"] | index_row["frame_terms_by_role"].get("subject", set()),
+            allow_contains=True,
+        )
+        and slot_matches_keys(
+            table_triplet.get("predicate"),
+            index_row["predicate_keys"] | index_row["frame_terms_by_role"].get("predicate", set()),
+            allow_contains=True,
+        )
+        and slot_matches_keys(
+            table_triplet.get("object"),
+            index_row["object_keys"] | index_row["frame_terms_by_role"].get("object", set()),
+            allow_contains=True,
+        )
+    )
+
+
+def relation_matches_table_triplet(index_row: dict[str, Any], table_triplet: dict[str, Any]) -> bool:
+    subject = canonical_match_text(table_triplet.get("subject"))
+    predicate = canonical_match_text(table_triplet.get("predicate"))
+    obj = canonical_match_text(table_triplet.get("object"))
+    if not subject or not predicate:
+        return False
+    if subject not in index_row["source_keys"]:
+        return False
+    if obj and obj not in index_row["target_keys"]:
+        return False
+    return predicate in index_row["predicate_keys"]
+
+
+def evaluate_table_triplets_against_graph(
+    rel_rows: list[dict[str, Any]],
+    tables_dir: str,
+    triplet_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    table_triplets = extract_table_test_triplets(tables_dir)
+    triplet_index = build_triplet_match_index(triplet_rows or [])
+    relation_index = build_relation_match_index(rel_rows)
+
+    detail_rows: list[dict[str, Any]] = []
+    true_positive = 0
+    false_negative = 0
+
+    for table_triplet in table_triplets:
+        match_type = ""
+        match = next((row for row in triplet_index if triplet_matches_direct(row, table_triplet)), None)
+        if match:
+            match_type = "direct_triplet"
+        if not match:
+            match = next((row for row in relation_index if relation_matches_table_triplet(row, table_triplet)), None)
+            if match:
+                match_type = "direct_relation"
+        if not match:
+            match = next((row for row in triplet_index if triplet_matches_frame(row, table_triplet)), None)
+            if match:
+                match_type = "frame_fallback"
+        if match:
+            true_positive += 1
+            status = "TP"
+        else:
+            false_negative += 1
+            status = "FN"
+        detail_rows.append(
+            {
+                **table_triplet,
+                "status": status,
+                "match_type": match_type,
+                "matched_triplet_id": match.get("triplet_id") if match else None,
+                "matched_document_id": match.get("document_id") if match else None,
+                "matched_subject": match.get("source_name") or match.get("subject") if match else "",
+                "matched_predicate": match.get("predicate") if match else "",
+                "matched_object": match.get("target_name") or match.get("object") if match else "",
+            }
+        )
+
+    total = true_positive + false_negative
+    recall = round(true_positive / total, 6) if total else 0.0
+    return {
+        "metrics": {
+            "table_triplets_total": total,
+            "table_triplets_tp": true_positive,
+            "table_triplets_fn": false_negative,
+            "table_triplets_recall": recall,
+        },
+        "table_triplet_rows": detail_rows,
+        "tables_dir": tables_dir,
+    }
 
 
 def char_ngrams(text: str, n_min: int = 2, n_max: int = 4) -> list[str]:
@@ -263,20 +555,98 @@ def compute_pagerank(
 
 def fetch_concept_relations(driver) -> list[dict[str, Any]]:
     query = """
-    MATCH (s:EntityConcept)-[r:RELATION_INSTANCE]->(o:EntityConcept)
-    RETURN
-      s.norm AS source_norm,
-      coalesce(s.name, s.norm) AS source_name,
-      o.norm AS target_norm,
-      coalesce(o.name, o.norm) AS target_name,
-      coalesce(r.predicate_norm, r.predicate, '') AS predicate_norm,
-      coalesce(r.predicate, '') AS predicate,
-      r.triplet_id AS triplet_id,
-      r.document_id AS document_id
+    CALL {
+      MATCH (s:EntityConcept)-[r:RELATION_INSTANCE]->(o:EntityConcept)
+      RETURN
+        s.norm AS source_norm,
+        coalesce(s.name, s.norm) AS source_name,
+        o.norm AS target_norm,
+        coalesce(o.name, o.norm) AS target_name,
+        coalesce(r.predicate_norm, r.predicate, '') AS predicate_norm,
+        coalesce(r.predicate, '') AS predicate,
+        r.triplet_id AS triplet_id,
+        r.document_id AS document_id
+      UNION ALL
+      MATCH (s:EntityConcept)-[r]->(o:EntityConcept)
+      WHERE type(r) IN [
+        'APPROVED_ALIAS_OF',
+        'APPROVED_BROADER_THAN',
+        'APPROVED_CONTEXT_LINK',
+        'MANUAL_CONTEXT_LINK',
+        'MANUAL_COMPONENT_LINK'
+      ]
+      RETURN
+        s.norm AS source_norm,
+        coalesce(s.name, s.norm) AS source_name,
+        o.norm AS target_norm,
+        coalesce(o.name, o.norm) AS target_name,
+        type(r) AS predicate_norm,
+        coalesce(r.relation_text, type(r)) AS predicate,
+        null AS triplet_id,
+        null AS document_id
+    }
+    RETURN source_norm, source_name, target_norm, target_name, predicate_norm, predicate, triplet_id, document_id
     """
     with driver.session() as session:
         result = session.run(query)
         return [dict(record) for record in result]
+
+
+def fetch_triplet_search_rows(driver) -> list[dict[str, Any]]:
+    query = """
+    MATCH (t:Triplet)
+    OPTIONAL MATCH (t)-[:SUBJECT]->(subj)
+    OPTIONAL MATCH (t)-[:PREDICATE]->(pred)
+    OPTIONAL MATCH (t)-[:OBJECT]->(obj)
+    OPTIONAL MATCH (t)-[:HAS_FRAME]->(occ:FrameOccurrence)-[:HAS_ROOT]->(root:FrameNode)
+    OPTIONAL MATCH (root)-[:CHILD*0..]->(node:FrameNode)
+    WITH
+      t,
+      subj,
+      pred,
+      obj,
+      occ.role AS role,
+      collect(DISTINCT coalesce(node.text, node.norm, '')) +
+      collect(DISTINCT coalesce(node.norm, node.text, '')) AS frame_terms
+    WITH
+      t,
+      subj,
+      pred,
+      obj,
+      collect({role: role, terms: [term IN frame_terms WHERE term <> '']}) AS role_frames
+    RETURN
+      t.triplet_id AS triplet_id,
+      t.document_id AS document_id,
+      coalesce(t.subject_text, subj.name, subj.norm, '') AS subject,
+      coalesce(subj.norm, '') AS subject_norm,
+      coalesce(t.predicate_text, pred.name, pred.norm, '') AS predicate,
+      coalesce(pred.norm, '') AS predicate_norm,
+      coalesce(t.object_text, obj.name, obj.norm, '') AS object,
+      coalesce(obj.norm, '') AS object_norm,
+      role_frames
+    """
+    with driver.session() as session:
+        rows: list[dict[str, Any]] = []
+        for record in session.run(query):
+            frame_terms_by_role: dict[str, list[str]] = {"subject": [], "predicate": [], "object": []}
+            for role_frame in record["role_frames"] or []:
+                role = role_frame.get("role")
+                if role in frame_terms_by_role:
+                    frame_terms_by_role[role].extend(role_frame.get("terms") or [])
+            rows.append(
+                {
+                    "triplet_id": record["triplet_id"],
+                    "document_id": record["document_id"],
+                    "subject": record["subject"] or "",
+                    "subject_norm": record["subject_norm"] or "",
+                    "predicate": record["predicate"] or "",
+                    "predicate_norm": record["predicate_norm"] or "",
+                    "object": record["object"] or "",
+                    "object_norm": record["object_norm"] or "",
+                    "frame_terms_by_role": frame_terms_by_role,
+                }
+            )
+        return rows
 
 
 def fetch_concept_contexts(driver) -> list[dict[str, Any]]:
@@ -460,21 +830,21 @@ def build_graph_metrics(rel_rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def compose_context_text(row: dict[str, Any]) -> str:
+def compose_context_text(row: dict[str, Any], include_frame_context: bool = True) -> str:
     name = row.get("concept_name") or row.get("concept_norm") or ""
     out_preds = ", ".join(sorted(set(row.get("out_preds", [])))) or "none"
     in_preds = ", ".join(sorted(set(row.get("in_preds", [])))) or "none"
-    child_terms = ", ".join(sorted(set(row.get("child_terms", [])))) or "none"
     occ_count = max(int(row.get("occ_count") or 0), 0)
-    return "\n".join(
-        [
-            f"concept: {name}",
-            f"outgoing predicates: {out_preds}",
-            f"incoming predicates: {in_preds}",
-            f"frame children: {child_terms}",
-            f"occurrence count: {occ_count}",
-        ]
-    )
+    parts = [
+        f"concept: {name}",
+        f"outgoing predicates: {out_preds}",
+        f"incoming predicates: {in_preds}",
+        f"occurrence count: {occ_count}",
+    ]
+    if include_frame_context:
+        child_terms = ", ".join(sorted(set(row.get("child_terms", [])))) or "none"
+        parts.insert(3, f"frame children: {child_terms}")
+    return "\n".join(parts)
 
 
 def tokenize_entity_name(text: str) -> list[str]:
@@ -695,11 +1065,12 @@ def prepare_context_embeddings(
     encoder_local_files_only: bool = False,
     encoder_batch_size: int = DEFAULT_ENCODER_BATCH_SIZE,
     encoder_max_length: int = DEFAULT_ENCODER_MAX_LENGTH,
+    include_frame_context: bool = True,
 ) -> tuple[list[list[float]], dict[str, Any]]:
     if not context_rows:
         return [], {"backend": "none", "model_name": None, "warning": None}
 
-    texts = [compose_context_text(row) for row in context_rows]
+    texts = [compose_context_text(row, include_frame_context=include_frame_context) for row in context_rows]
     embedding_data = embed_texts(
         texts=texts,
         embedding_backend=embedding_backend,
@@ -720,6 +1091,7 @@ def score_context_pair(
     right: dict[str, Any],
     left_vector: list[float],
     right_vector: list[float],
+    include_frame_context: bool = True,
 ) -> dict[str, Any]:
     left_predicates = set(left.get("out_preds", [])) | set(left.get("in_preds", []))
     right_predicates = set(right.get("out_preds", [])) | set(right.get("in_preds", []))
@@ -731,9 +1103,12 @@ def score_context_pair(
     right_docs = set(right.get("document_ids", []))
 
     predicate_overlap = jaccard_similarity(left_predicates, right_predicates)
-    child_overlap = jaccard_similarity(left_children, right_children)
+    child_overlap = jaccard_similarity(left_children, right_children) if include_frame_context else 0.0
     occ_balance = min(left_occ, right_occ) / max(left_occ, right_occ)
-    structural_score = 0.45 * predicate_overlap + 0.45 * child_overlap + 0.10 * occ_balance
+    if include_frame_context:
+        structural_score = 0.45 * predicate_overlap + 0.45 * child_overlap + 0.10 * occ_balance
+    else:
+        structural_score = 0.85 * predicate_overlap + 0.15 * occ_balance
     embedding_score = cosine_dense(left_vector, right_vector)
     combined_score = 0.55 * structural_score + 0.45 * embedding_score
     doc_overlap = jaccard_similarity({str(item) for item in left_docs}, {str(item) for item in right_docs})
@@ -743,7 +1118,7 @@ def score_context_pair(
     shared_predicates = sorted(left_predicates & right_predicates)
     shared_children = sorted(left_children & right_children)
     shared_documents = sorted(left_docs & right_docs)
-    support = len(shared_predicates) + len(shared_children)
+    support = len(shared_predicates) + (len(shared_children) if include_frame_context else 0)
 
     return {
         "support": support,
@@ -774,6 +1149,7 @@ def rank_synonym_candidates(
     encoder_max_length: int = DEFAULT_ENCODER_MAX_LENGTH,
     embedding_vectors: list[list[float]] | None = None,
     embedding_info: dict[str, Any] | None = None,
+    include_frame_context: bool = True,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if embedding_vectors is None or embedding_info is None:
         embedding_vectors, embedding_info = prepare_context_embeddings(
@@ -783,6 +1159,7 @@ def rank_synonym_candidates(
             encoder_local_files_only=encoder_local_files_only,
             encoder_batch_size=encoder_batch_size,
             encoder_max_length=encoder_max_length,
+            include_frame_context=include_frame_context,
         )
     if not context_rows:
         return [], embedding_info
@@ -796,7 +1173,13 @@ def rank_synonym_candidates(
             if left["concept_norm"] == right["concept_norm"]:
                 continue
 
-            score = score_context_pair(left, right, embedding_vectors[left_idx], embedding_vectors[right_idx])
+            score = score_context_pair(
+                left,
+                right,
+                embedding_vectors[left_idx],
+                embedding_vectors[right_idx],
+                include_frame_context=include_frame_context,
+            )
 
             if score["combined_score"] < min_combined_score or score["structural_score"] < min_structural_score:
                 continue
@@ -841,6 +1224,7 @@ def rank_context_bridges(
     encoder_max_length: int = DEFAULT_ENCODER_MAX_LENGTH,
     embedding_vectors: list[list[float]] | None = None,
     embedding_info: dict[str, Any] | None = None,
+    include_frame_context: bool = True,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if embedding_vectors is None or embedding_info is None:
         embedding_vectors, embedding_info = prepare_context_embeddings(
@@ -850,6 +1234,7 @@ def rank_context_bridges(
             encoder_local_files_only=encoder_local_files_only,
             encoder_batch_size=encoder_batch_size,
             encoder_max_length=encoder_max_length,
+            include_frame_context=include_frame_context,
         )
     if not context_rows:
         return [], embedding_info
@@ -868,7 +1253,13 @@ def rank_context_bridges(
             if left["component_id"] == right["component_id"]:
                 continue
 
-            score = score_context_pair(left, right, embedding_vectors[left_idx], embedding_vectors[right_idx])
+            score = score_context_pair(
+                left,
+                right,
+                embedding_vectors[left_idx],
+                embedding_vectors[right_idx],
+                include_frame_context=include_frame_context,
+            )
             if score["bridge_score"] < min_bridge_score or score["structural_score"] < min_structural_score:
                 continue
 
@@ -1053,11 +1444,19 @@ def analyze_graph(
     encoder_local_files_only: bool = False,
     encoder_batch_size: int = DEFAULT_ENCODER_BATCH_SIZE,
     encoder_max_length: int = DEFAULT_ENCODER_MAX_LENGTH,
+    include_frame_context: bool = True,
+    table_tests_dir: str | None = None,
+    include_table_tests: bool = True,
 ) -> dict[str, Any]:
     driver = get_neo4j_driver(neo_cfg)
     try:
         rel_rows = fetch_concept_relations(driver)
+        triplet_rows = fetch_triplet_search_rows(driver)
         graph_data = build_graph_metrics(rel_rows)
+        table_test_data = {"metrics": {}, "table_triplet_rows": [], "tables_dir": table_tests_dir}
+        if include_table_tests:
+            resolved_tables_dir = table_tests_dir or os.path.join(os.getcwd(), "tables_for_test")
+            table_test_data = evaluate_table_triplets_against_graph(rel_rows, resolved_tables_dir, triplet_rows)
         context_rows = attach_context_metadata(
             context_rows=fetch_concept_contexts(driver),
             component_by_norm=graph_data["component_by_norm"],
@@ -1070,6 +1469,7 @@ def analyze_graph(
             encoder_local_files_only=encoder_local_files_only,
             encoder_batch_size=encoder_batch_size,
             encoder_max_length=encoder_max_length,
+            include_frame_context=include_frame_context,
         )
         synonym_rows, embedding_info = rank_synonym_candidates(
             context_rows=context_rows,
@@ -1079,6 +1479,7 @@ def analyze_graph(
             embedding_backend="fallback",
             embedding_vectors=embedding_vectors,
             embedding_info=embedding_info,
+            include_frame_context=include_frame_context,
         )
         bridge_rows, _ = rank_context_bridges(
             context_rows=context_rows,
@@ -1088,6 +1489,7 @@ def analyze_graph(
             embedding_backend="fallback",
             embedding_vectors=embedding_vectors,
             embedding_info=embedding_info,
+            include_frame_context=include_frame_context,
         )
         bridge_metrics = project_components_with_bridges(graph_data["graph"], bridge_rows)
         legacy_root_rows, legacy_embedding_info = rank_legacy_context_roots(
@@ -1112,7 +1514,7 @@ def analyze_graph(
             sync_graph_root(driver, graph_data["global_root"], graph_data["component_rows"])
 
         return {
-            "metrics": {**graph_data["metrics"], **bridge_metrics},
+            "metrics": {**graph_data["metrics"], **bridge_metrics, **table_test_data["metrics"]},
             "degree_rows": graph_data["degree_rows"],
             "cycle_rows": graph_data["cycle_rows"],
             "component_rows": graph_data["component_rows"],
@@ -1120,8 +1522,11 @@ def analyze_graph(
             "synonym_rows": synonym_rows,
             "bridge_rows": bridge_rows,
             "legacy_root_rows": legacy_root_rows,
+            "table_triplet_rows": table_test_data["table_triplet_rows"],
+            "table_tests_dir": table_test_data["tables_dir"],
             "embedding_info": embedding_info,
             "legacy_embedding_info": legacy_embedding_info,
+            "include_frame_context": include_frame_context,
         }
     finally:
         driver.close()

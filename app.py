@@ -1,9 +1,12 @@
 ﻿import hashlib
 import io
 import json
+import os
 import traceback
 from typing import Any
 import re
+import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape as xml_escape
 import pandas as pd
 import streamlit as st
 from pandas.errors import ParserError
@@ -1067,6 +1070,11 @@ def delete_document_by_id(
 
     pg_deleted = 0
     neo_deleted = 0
+    neo_deleted_triplets = 0
+    neo_deleted_frames = 0
+    neo_deleted_frame_nodes = 0
+    neo_deleted_documents = 0
+    neo_deleted_orphans = 0
     try:
         with pg_conn:
             with pg_conn.cursor() as cur:
@@ -1087,30 +1095,137 @@ def delete_document_by_id(
         driver = GraphDatabase.driver(neo_cfg["uri"], auth=(neo_cfg["user"], neo_cfg["password"]))
         try:
             with driver.session() as session:
-                result = session.run(
+                record = session.run(
                     """
-                    MATCH ()-[r:RELATION]->()
-                    WHERE r.document_id = $document_id
-                    DELETE r
-                    RETURN count(r) AS deleted_count
+                    MATCH (t:Triplet {document_id: $document_id})
+                    RETURN collect(t.triplet_id) AS triplet_ids, count(t) AS triplet_count
                     """,
                     {"document_id": int(document_id)},
-                )
-                record = result.single()
-                neo_deleted = int(record["deleted_count"] if record else 0)
+                ).single()
+                triplet_ids = list(record["triplet_ids"] if record else [])
+                neo_deleted_triplets = int(record["triplet_count"] if record else 0)
 
-                # Remove orphaned entity nodes to keep graph clean.
+                rel_record = session.run(
+                    """
+                    MATCH ()-[r]->()
+                    WHERE r.document_id = $document_id
+                       OR ($triplet_ids <> [] AND r.triplet_id IN $triplet_ids)
+                    WITH collect(r) AS rels
+                    WITH rels, size(rels) AS deleted_count
+                    FOREACH (r IN rels | DELETE r)
+                    RETURN deleted_count
+                    """,
+                    {"document_id": int(document_id), "triplet_ids": triplet_ids},
+                ).single()
+                neo_deleted = int(rel_record["deleted_count"] if rel_record else 0)
+
+                frame_node_record = session.run(
+                    """
+                    MATCH (n:FrameNode)
+                    WHERE n.triplet_id IN $triplet_ids
+                    WITH collect(n) AS nodes
+                    WITH nodes, size(nodes) AS deleted_count
+                    FOREACH (n IN nodes | DETACH DELETE n)
+                    RETURN deleted_count
+                    """,
+                    {"triplet_ids": triplet_ids},
+                ).single()
+                neo_deleted_frame_nodes = int(frame_node_record["deleted_count"] if frame_node_record else 0)
+
+                frame_record = session.run(
+                    """
+                    MATCH (occ:FrameOccurrence)
+                    WHERE occ.document_id = $document_id
+                       OR occ.triplet_id IN $triplet_ids
+                    WITH collect(occ) AS occs
+                    WITH occs, size(occs) AS deleted_count
+                    FOREACH (occ IN occs | DETACH DELETE occ)
+                    RETURN deleted_count
+                    """,
+                    {"document_id": int(document_id), "triplet_ids": triplet_ids},
+                ).single()
+                neo_deleted_frames = int(frame_record["deleted_count"] if frame_record else 0)
+
+                triplet_record = session.run(
+                    """
+                    MATCH (t:Triplet)
+                    WHERE t.document_id = $document_id
+                    WITH collect(t) AS triplets
+                    WITH triplets, size(triplets) AS deleted_count
+                    FOREACH (t IN triplets | DETACH DELETE t)
+                    RETURN deleted_count
+                    """,
+                    {"document_id": int(document_id)},
+                ).single()
+                neo_deleted_triplets = int(triplet_record["deleted_count"] if triplet_record else neo_deleted_triplets)
+
+                doc_record = session.run(
+                    """
+                    MATCH (d:Document {document_id: $document_id})
+                    WITH collect(d) AS docs
+                    WITH docs, size(docs) AS deleted_count
+                    FOREACH (d IN docs | DETACH DELETE d)
+                    RETURN deleted_count
+                    """,
+                    {"document_id": int(document_id)},
+                ).single()
+                neo_deleted_documents = int(doc_record["deleted_count"] if doc_record else 0)
+
+                # Derived analytics edges become stale after document deletion; they are rebuilt by the analytics step.
                 session.run(
                     """
-                    MATCH (n:Entity)
-                    WHERE NOT (n)--()
-                    DELETE n
+                    MATCH ()-[r:SYNONYM_CANDIDATE|CONTEXT_BRIDGE|CONTEXT_PARENT]->()
+                    DELETE r
+                    """,
+                )
+                session.run(
+                    """
+                    MATCH (:GraphRoot)-[r:HAS_COMPONENT_ROOT]->()
+                    DELETE r
                     """
                 )
+
+                orphan_record = session.run(
+                    """
+                    CALL {
+                      MATCH (n:Entity)
+                      WHERE NOT (n)--()
+                      WITH collect(n) AS nodes
+                      FOREACH (n IN nodes | DELETE n)
+                      RETURN size(nodes) AS deleted_count
+                      UNION ALL
+                      MATCH (c:EntityConcept)
+                      WHERE NOT (c)<-[:SUBJECT|OBJECT]-(:Triplet)
+                        AND NOT (c)<-[:OF_CONCEPT]-(:FrameOccurrence)
+                        AND NOT (c)-[:RELATION_INSTANCE]-(:EntityConcept)
+                        AND NOT (c)-[:APPROVED_ALIAS_OF|APPROVED_BROADER_THAN|APPROVED_CONTEXT_LINK|MANUAL_CONTEXT_LINK|MANUAL_COMPONENT_LINK]-(:EntityConcept)
+                      WITH collect(c) AS nodes
+                      FOREACH (c IN nodes | DETACH DELETE c)
+                      RETURN size(nodes) AS deleted_count
+                      UNION ALL
+                      MATCH (p:RelationConcept)
+                      WHERE NOT (p)<-[:PREDICATE]-(:Triplet)
+                        AND NOT (p)<-[:OF_CONCEPT]-(:FrameOccurrence)
+                      WITH collect(p) AS nodes
+                      FOREACH (p IN nodes | DETACH DELETE p)
+                      RETURN size(nodes) AS deleted_count
+                    }
+                    RETURN sum(deleted_count) AS deleted_count
+                    """
+                ).single()
+                neo_deleted_orphans = int(orphan_record["deleted_count"] if orphan_record else 0)
         finally:
             driver.close()
 
-    return {"pg_deleted_documents": pg_deleted, "neo_deleted_relations": neo_deleted}
+    return {
+        "pg_deleted_documents": pg_deleted,
+        "neo_deleted_relations": neo_deleted,
+        "neo_deleted_triplets": neo_deleted_triplets,
+        "neo_deleted_frames": neo_deleted_frames,
+        "neo_deleted_frame_nodes": neo_deleted_frame_nodes,
+        "neo_deleted_documents": neo_deleted_documents,
+        "neo_deleted_orphans": neo_deleted_orphans,
+    }
 
 
 def fetch_concept_aliases(
@@ -1628,7 +1743,11 @@ def render_documents_list_section() -> None:
                         )
                     st.success(
                         f"Удалено в PostgreSQL: {stats['pg_deleted_documents']} документ(ов), "
-                        f"в Neo4j: {stats['neo_deleted_relations']} связь(ей)."
+                        f"в Neo4j: связей={stats['neo_deleted_relations']}, "
+                        f"триплетов={stats.get('neo_deleted_triplets', 0)}, "
+                        f"frame-occurrence={stats.get('neo_deleted_frames', 0)}, "
+                        f"frame-узлов={stats.get('neo_deleted_frame_nodes', 0)}, "
+                        f"сиротских вершин={stats.get('neo_deleted_orphans', 0)}."
                     )
                     # Обновляем список после удаления.
                     st.session_state["pg_docs_rows"] = fetch_pg_documents(pg_cfg, limit=limit)
@@ -1842,6 +1961,173 @@ def render_concept_aliases_section() -> None:
         st.info("Загрузите концепты, чтобы проверить их или слить.")
 
 
+def format_concept_option(row: dict[str, Any]) -> str:
+    return (
+        f"{row['name']} | norm={row['norm']} | "
+        f"in={row['in_degree']} out={row['out_degree']} frame={row['frame_count']}"
+    )
+
+
+def render_context_merge_tools(uri: str, user: str, password: str, analytics_result: dict[str, Any] | None) -> None:
+    st.subheader("Ревью и ручное связывание концептов")
+    st.caption(
+        "Одобренные связи не удаляют вершины: они фиксируют решение ревью и сохраняют исходные frame-свидетельства."
+    )
+
+    if analytics_result:
+        candidate_groups = {
+            "Синонимия по контексту": analytics_result.get("synonym_rows") or [],
+            "Мост между компонентами": analytics_result.get("bridge_rows") or [],
+        }
+        candidate_kind = st.selectbox(
+            "Тип кандидата",
+            options=list(candidate_groups.keys()),
+            key="context_merge_candidate_kind",
+        )
+        candidates = candidate_groups[candidate_kind]
+        if candidates:
+            labels = [
+                (
+                    f"{idx + 1}. {row['left_name']} -> {row['right_name']} | "
+                    f"score={row.get('combined_score', row.get('bridge_score', ''))}"
+                )
+                for idx, row in enumerate(candidates)
+            ]
+            selected_label = st.selectbox(
+                "Кандидат из последней аналитики",
+                options=labels,
+                key="context_merge_candidate_select",
+            )
+            selected_idx = labels.index(selected_label)
+            selected_row = candidates[selected_idx]
+            st.dataframe(pd.DataFrame([selected_row]), use_container_width=True)
+            review_note = st.text_input("Комментарий ревью", value="", key="context_merge_candidate_note")
+            relation_kind = "alias" if candidate_kind == "Синонимия по контексту" else "context"
+            default_relation = "алиас" if relation_kind == "alias" else "контекстная связь"
+            relation_text = st.text_input(
+                "Подпись одобренной связи",
+                value=default_relation,
+                key="context_merge_candidate_relation_text",
+            )
+            if st.button("Одобрить выбранную связь", key="approve_context_candidate_btn"):
+                try:
+                    create_approved_concept_relation(
+                        uri=uri,
+                        user=user,
+                        password=password,
+                        left_norm=selected_row["left_norm"],
+                        right_norm=selected_row["right_norm"],
+                        relation_kind=relation_kind,
+                        relation_text=relation_text.strip() or default_relation,
+                        note=review_note.strip(),
+                    )
+                    st.success("Одобренная связь записана в Neo4j.")
+                except Exception as exc:
+                    st.error(f"Не удалось записать одобренную связь: {exc}")
+                    st.code(traceback.format_exc(), language="text")
+        else:
+            st.info("В последней аналитике нет кандидатов выбранного типа.")
+    else:
+        st.info("Запустите аналитику, чтобы одобрять найденные кандидаты.")
+
+    with st.expander("Добавить собственную вершину или ручную связь между компонентами", expanded=False):
+        manual_filter = st.text_input("Фильтр концептов для ручной связи", value="", key="manual_context_filter")
+        manual_limit = st.number_input(
+            "Сколько концептов загрузить",
+            min_value=20,
+            max_value=1000,
+            value=200,
+            step=20,
+            key="manual_context_limit",
+        )
+        if st.button("Загрузить концепты для ручной связи", key="load_manual_context_concepts_btn"):
+            try:
+                st.session_state["manual_context_concepts"] = fetch_neo4j_entity_concept_options(
+                    uri=uri,
+                    user=user,
+                    password=password,
+                    limit=int(manual_limit),
+                    contains=manual_filter,
+                )
+            except Exception as exc:
+                st.error(f"Не удалось загрузить концепты: {exc}")
+                st.code(traceback.format_exc(), language="text")
+
+        concepts = st.session_state.get("manual_context_concepts", [])
+        if concepts:
+            labels = [format_concept_option(row) for row in concepts]
+            c1, c2 = st.columns(2)
+            with c1:
+                left_label = st.selectbox("Левая вершина", options=labels, key="manual_context_left")
+            with c2:
+                right_label = st.selectbox("Правая вершина", options=labels, key="manual_context_right")
+            left_row = concepts[labels.index(left_label)]
+            right_row = concepts[labels.index(right_label)]
+
+            relation_text = st.text_input(
+                "Текст связи",
+                value="связано по контексту",
+                key="manual_context_relation_text",
+            )
+            use_connector = st.checkbox(
+                "Добавить собственную вершину-связку между компонентами",
+                value=True,
+                key="manual_context_use_connector",
+            )
+            auto_connector_name = st.checkbox(
+                "Выделить автоматически",
+                value=True,
+                key="manual_context_auto_connector",
+                help="Имя вершины-связки будет собрано из текста связи, как служебный родитель/коннектор.",
+            )
+            connector_name = ""
+            if use_connector and not auto_connector_name:
+                connector_name = st.text_input(
+                    "Название собственной вершины",
+                    value="",
+                    key="manual_context_connector_name",
+                )
+            manual_note = st.text_input("Комментарий", value="", key="manual_context_note")
+
+            if st.button("Записать ручную связь", key="save_manual_context_link_btn"):
+                if left_row["norm"] == right_row["norm"]:
+                    st.warning("Выберите две разные вершины.")
+                elif not relation_text.strip():
+                    st.warning("Заполните текст связи.")
+                else:
+                    try:
+                        if use_connector:
+                            connector = create_manual_component_connector(
+                                uri=uri,
+                                user=user,
+                                password=password,
+                                left_norm=left_row["norm"],
+                                right_norm=right_row["norm"],
+                                connector_name=connector_name,
+                                relation_text=relation_text.strip(),
+                                auto_name=auto_connector_name,
+                                note=manual_note.strip(),
+                            )
+                            st.success(f"Добавлена вершина-связка: {connector['connector_name']}.")
+                        else:
+                            create_approved_concept_relation(
+                                uri=uri,
+                                user=user,
+                                password=password,
+                                left_norm=left_row["norm"],
+                                right_norm=right_row["norm"],
+                                relation_kind="manual",
+                                relation_text=relation_text.strip(),
+                                note=manual_note.strip(),
+                            )
+                            st.success("Ручная связь записана в Neo4j.")
+                    except Exception as exc:
+                        st.error(f"Не удалось записать ручную связь: {exc}")
+                        st.code(traceback.format_exc(), language="text")
+        else:
+            st.caption("Загрузите список концептов, чтобы выбрать вершины.")
+
+
 def render_graph_analytics_section() -> None:
     st.subheader("Аналитика графа и синонимов")
     c1, c2, c3 = st.columns(3)
@@ -1957,6 +2243,22 @@ def render_graph_analytics_section() -> None:
         value=True,
         key="analytics_sync_root",
     )
+    include_frame_context = st.checkbox(
+        "Учитывать frame-контекст при поиске синонимов и мостов",
+        value=True,
+        key="analytics_include_frame_context",
+    )
+    include_table_tests = st.checkbox(
+        "Проверить граф по CSV-таблицам",
+        value=True,
+        key="analytics_include_table_tests",
+    )
+    table_tests_dir = st.text_input(
+        "Папка с тестовыми таблицами",
+        value=st.session_state.get("analytics_table_tests_dir", "tables_for_test"),
+        key="analytics_table_tests_dir",
+        disabled=not include_table_tests,
+    )
 
     st.caption("Слой эмбеддингов")
     emb1, emb2 = st.columns(2)
@@ -2051,6 +2353,9 @@ def render_graph_analytics_section() -> None:
                     encoder_local_files_only=bool(encoder_local_only),
                     encoder_batch_size=int(encoder_batch_size),
                     encoder_max_length=int(encoder_max_length),
+                    include_frame_context=bool(include_frame_context),
+                    table_tests_dir=os.path.abspath(table_tests_dir.strip() or "tables_for_test"),
+                    include_table_tests=bool(include_table_tests),
                 )
             st.success("Аналитика графа завершена.")
         except Exception as exc:
@@ -2068,6 +2373,7 @@ def render_graph_analytics_section() -> None:
     result = st.session_state["graph_analytics_result"]
     if not result:
         st.info("Запустите аналитику, чтобы увидеть степени вершин, циклы, корневые вершины и синонимические связи.")
+        render_context_merge_tools(uri=uri, user=user, password=password, analytics_result=None)
         return
 
     embedding_info = result.get("embedding_info") or {}
@@ -2098,9 +2404,26 @@ def render_graph_analytics_section() -> None:
             "bridge_edges_count": metrics.get("bridge_edges_count", 0),
             "components_after_bridges": metrics.get("components_after_bridges", metrics["components_count"]),
             "components_merged_by_bridges": metrics.get("components_merged_by_bridges", 0),
+            "table_triplets_total": metrics.get("table_triplets_total", 0),
+            "table_triplets_tp": metrics.get("table_triplets_tp", 0),
+            "table_triplets_fn": metrics.get("table_triplets_fn", 0),
+            "table_triplets_recall": metrics.get("table_triplets_recall", 0.0),
         }
     ]
     st.dataframe(pd.DataFrame(metrics_rows), use_container_width=True)
+
+    table_rows = result.get("table_triplet_rows") or []
+    st.caption("Проверка триплетов из таблиц")
+    if table_rows:
+        st.write(
+            f"Папка: `{result.get('table_tests_dir') or ''}`. "
+            f"TP={metrics.get('table_triplets_tp', 0)}, "
+            f"FN={metrics.get('table_triplets_fn', 0)}, "
+            f"recall={metrics.get('table_triplets_recall', 0.0)}."
+        )
+        st.dataframe(pd.DataFrame(table_rows), use_container_width=True)
+    elif result.get("table_tests_dir"):
+        st.info("Тестовые CSV-триплеты не найдены или проверка отключена.")
 
     global_root = result.get("global_root")
     if global_root:
@@ -2145,6 +2468,8 @@ def render_graph_analytics_section() -> None:
     else:
         st.caption("Общие legacy-сущности по контексту")
         st.info("По текущим порогам общие legacy-сущности не найдены.")
+
+    render_context_merge_tools(uri=uri, user=user, password=password, analytics_result=result)
 
 
 def escape_dot(value: str) -> str:
@@ -2679,6 +3004,619 @@ def fetch_neo4j_context_bridges(
         driver.close()
 
 
+def fetch_neo4j_approved_context_links(
+    uri: str,
+    user: str,
+    password: str,
+    limit: int,
+    contains: str,
+) -> list[dict[str, Any]]:
+    query = """
+    MATCH (s:EntityConcept)-[r]->(o:EntityConcept)
+    WHERE type(r) IN [
+      'APPROVED_ALIAS_OF',
+      'APPROVED_BROADER_THAN',
+      'APPROVED_CONTEXT_LINK',
+      'MANUAL_CONTEXT_LINK',
+      'MANUAL_COMPONENT_LINK'
+    ]
+      AND (
+        $contains = ""
+        OR toLower(coalesce(s.name, s.norm, "")) CONTAINS toLower($contains)
+        OR toLower(coalesce(o.name, o.norm, "")) CONTAINS toLower($contains)
+        OR toLower(coalesce(r.relation_text, "")) CONTAINS toLower($contains)
+      )
+    RETURN
+      coalesce(s.name, s.norm) AS subject,
+      coalesce(r.relation_text, type(r)) AS predicate,
+      coalesce(o.name, o.norm) AS object,
+      type(r) AS relation_type,
+      coalesce(r.note, '') AS note
+    ORDER BY relation_type, subject, object
+    LIMIT $limit
+    """
+    driver = get_neo4j_driver(uri, user, password)
+    try:
+        with driver.session() as session:
+            return [dict(record) for record in session.run(query, {"contains": contains, "limit": int(limit)})]
+    finally:
+        driver.close()
+
+
+def normalize_graph_export_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (list, tuple, set)):
+        return [normalize_graph_export_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): normalize_graph_export_value(item) for key, item in value.items()}
+    return str(value)
+
+
+def fetch_neo4j_full_graph_export(
+    uri: str,
+    user: str,
+    password: str,
+    node_limit: int,
+    relation_limit: int,
+    contains: str = "",
+) -> dict[str, Any]:
+    node_query = """
+    MATCH (n)
+    WHERE $contains = ""
+       OR any(label IN labels(n) WHERE toLower(label) CONTAINS toLower($contains))
+       OR any(value IN [key IN keys(n) | toString(n[key])] WHERE toLower(value) CONTAINS toLower($contains))
+    WITH n
+    ORDER BY elementId(n)
+    LIMIT $node_limit
+    RETURN
+      elementId(n) AS id,
+      id(n) AS neo4j_id,
+      labels(n) AS labels,
+      properties(n) AS properties
+    """
+    rel_query = """
+    MATCH (a)-[r]->(b)
+    WHERE $contains = ""
+       OR toLower(type(r)) CONTAINS toLower($contains)
+       OR any(value IN [key IN keys(r) | toString(r[key])] WHERE toLower(value) CONTAINS toLower($contains))
+       OR any(value IN [key IN keys(a) | toString(a[key])] WHERE toLower(value) CONTAINS toLower($contains))
+       OR any(value IN [key IN keys(b) | toString(b[key])] WHERE toLower(value) CONTAINS toLower($contains))
+    WITH a, r, b
+    ORDER BY elementId(r)
+    LIMIT $relation_limit
+    RETURN
+      elementId(r) AS id,
+      id(r) AS neo4j_id,
+      type(r) AS type,
+      elementId(a) AS source,
+      elementId(b) AS target,
+      properties(r) AS properties
+    """
+    driver = get_neo4j_driver(uri, user, password)
+    try:
+        with driver.session() as session:
+            nodes = [
+                {
+                    "id": record["id"],
+                    "neo4j_id": int(record["neo4j_id"]),
+                    "labels": list(record["labels"] or []),
+                    "properties": normalize_graph_export_value(dict(record["properties"] or {})),
+                }
+                for record in session.run(
+                    node_query,
+                    {
+                        "contains": contains,
+                        "node_limit": int(node_limit),
+                    },
+                )
+            ]
+            node_ids = {node["id"] for node in nodes}
+            edges = []
+            skipped_edges = 0
+            for record in session.run(
+                rel_query,
+                {
+                    "contains": contains,
+                    "relation_limit": int(relation_limit),
+                },
+            ):
+                edge = {
+                    "id": record["id"],
+                    "neo4j_id": int(record["neo4j_id"]),
+                    "type": record["type"] or "",
+                    "source": record["source"],
+                    "target": record["target"],
+                    "properties": normalize_graph_export_value(dict(record["properties"] or {})),
+                }
+                if edge["source"] not in node_ids or edge["target"] not in node_ids:
+                    skipped_edges += 1
+                    continue
+                edges.append(edge)
+            return {
+                "format": "neo4j_graph_export",
+                "nodes": nodes,
+                "edges": edges,
+                "meta": {
+                    "node_count": len(nodes),
+                    "edge_count": len(edges),
+                    "skipped_edges_outside_node_limit": skipped_edges,
+                    "node_limit": int(node_limit),
+                    "relation_limit": int(relation_limit),
+                    "filter": contains,
+                },
+            }
+    finally:
+        driver.close()
+
+
+def graph_export_to_json_bytes(graph_data: dict[str, Any]) -> bytes:
+    return json.dumps(graph_data, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+
+
+def graph_export_to_graphml_bytes(graph_data: dict[str, Any]) -> bytes:
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<graphml xmlns="http://graphml.graphdrawing.org/xmlns">',
+        '  <key id="neo4j_element_id" for="node" attr.name="neo4j_element_id" attr.type="string"/>',
+        '  <key id="label" for="node" attr.name="label" attr.type="string"/>',
+        '  <key id="labels" for="node" attr.name="labels" attr.type="string"/>',
+        '  <key id="properties_json" for="node" attr.name="properties_json" attr.type="string"/>',
+        '  <key id="edge_neo4j_element_id" for="edge" attr.name="neo4j_element_id" attr.type="string"/>',
+        '  <key id="type" for="edge" attr.name="type" attr.type="string"/>',
+        '  <key id="edge_properties_json" for="edge" attr.name="properties_json" attr.type="string"/>',
+        '  <graph id="G" edgedefault="directed">',
+    ]
+    graphml_node_ids = {
+        str(node["id"]): f"n{idx}"
+        for idx, node in enumerate(graph_data.get("nodes", []))
+    }
+    for node in graph_data.get("nodes", []):
+        original_node_id = str(node["id"])
+        node_id = graphml_node_ids[original_node_id]
+        props = node.get("properties") or {}
+        label = props.get("name") or props.get("text") or props.get("norm") or node_id
+        props_json = json.dumps(props, ensure_ascii=False, sort_keys=True, default=str)
+        labels_text = ", ".join(node.get("labels") or [])
+        lines.extend(
+            [
+                f'    <node id="{node_id}">',
+                f'      <data key="neo4j_element_id">{xml_escape(original_node_id)}</data>',
+                f'      <data key="label">{xml_escape(str(label))}</data>',
+                f'      <data key="labels">{xml_escape(labels_text)}</data>',
+                f'      <data key="properties_json">{xml_escape(props_json)}</data>',
+                "    </node>",
+            ]
+        )
+    for idx, edge in enumerate(graph_data.get("edges", [])):
+        edge_id = f"e{idx}"
+        original_edge_id = str(edge["id"])
+        source = graphml_node_ids.get(str(edge["source"]))
+        target = graphml_node_ids.get(str(edge["target"]))
+        if source is None or target is None:
+            continue
+        props_json = json.dumps(edge.get("properties") or {}, ensure_ascii=False, sort_keys=True, default=str)
+        lines.extend(
+            [
+                f'    <edge id="{edge_id}" source="{source}" target="{target}">',
+                f'      <data key="edge_neo4j_element_id">{xml_escape(original_edge_id)}</data>',
+                f'      <data key="type">{xml_escape(str(edge.get("type") or ""))}</data>',
+                f'      <data key="edge_properties_json">{xml_escape(props_json)}</data>',
+                "    </edge>",
+            ]
+        )
+    lines.extend(["  </graph>", "</graphml>"])
+    return "\n".join(lines).encode("utf-8")
+
+
+def sanitize_cypher_identifier(value: str, fallback: str) -> str:
+    cleaned = re.sub(r"[^0-9A-Za-z_]", "_", value or "").strip("_")
+    if not cleaned:
+        cleaned = fallback
+    if cleaned[0].isdigit():
+        cleaned = f"{fallback}_{cleaned}"
+    return cleaned[:120]
+
+
+def sanitize_node_label(value: str) -> str:
+    return sanitize_cypher_identifier(value, "ImportedNode")
+
+
+def sanitize_relation_type(value: str) -> str:
+    return sanitize_cypher_identifier(value, "IMPORTED_RELATION").upper()
+
+
+def coerce_neo4j_property_value(value: Any) -> Any:
+    value = normalize_graph_export_value(value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        if all(item is None or isinstance(item, (str, int, float, bool)) for item in value):
+            return [item for item in value if item is not None]
+        return json.dumps(value, ensure_ascii=False, default=str)
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def coerce_neo4j_properties(properties: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in (properties or {}).items():
+        clean_key = sanitize_cypher_identifier(str(key), "property")
+        clean_value = coerce_neo4j_property_value(value)
+        if clean_value is not None:
+            result[clean_key] = clean_value
+    return result
+
+
+def parse_graph_json_upload(file_bytes: bytes) -> dict[str, Any]:
+    raw = json.loads(decode_bytes_safe(file_bytes))
+    if isinstance(raw, dict) and "nodes" in raw and ("edges" in raw or "relationships" in raw):
+        nodes = raw.get("nodes") or []
+        edges = raw.get("edges") or raw.get("relationships") or []
+    elif isinstance(raw, list):
+        raise ValueError("JSON должен быть объектом с полями nodes и edges, а не списком.")
+    else:
+        raise ValueError("JSON должен содержать поля nodes и edges.")
+
+    parsed_nodes = []
+    for idx, node in enumerate(nodes):
+        if not isinstance(node, dict):
+            continue
+        node_id = str(node.get("id") or node.get("neo4j_id") or f"node_{idx}")
+        labels = node.get("labels") or node.get("label") or ["ImportedNode"]
+        if isinstance(labels, str):
+            labels = [labels]
+        props = node.get("properties") or {}
+        if not isinstance(props, dict):
+            props = {"value": props}
+        parsed_nodes.append(
+            {
+                "id": node_id,
+                "labels": [str(label) for label in labels if str(label).strip()],
+                "properties": props,
+            }
+        )
+
+    parsed_edges = []
+    for idx, edge in enumerate(edges):
+        if not isinstance(edge, dict):
+            continue
+        source = edge.get("source") or edge.get("from") or edge.get("start")
+        target = edge.get("target") or edge.get("to") or edge.get("end")
+        if source is None or target is None:
+            continue
+        props = edge.get("properties") or {}
+        if not isinstance(props, dict):
+            props = {"value": props}
+        parsed_edges.append(
+            {
+                "id": str(edge.get("id") or edge.get("neo4j_id") or f"edge_{idx}"),
+                "source": str(source),
+                "target": str(target),
+                "type": str(edge.get("type") or edge.get("label") or "IMPORTED_RELATION"),
+                "properties": props,
+            }
+        )
+    return {"nodes": parsed_nodes, "edges": parsed_edges, "meta": {"source_format": "json"}}
+
+
+def parse_graphml_upload(file_bytes: bytes) -> dict[str, Any]:
+    root = ET.fromstring(file_bytes)
+    namespace = ""
+    if root.tag.startswith("{"):
+        namespace = root.tag.split("}", 1)[0][1:]
+    ns = {"g": namespace} if namespace else {}
+    prefix = "g:" if namespace else ""
+
+    key_names: dict[str, str] = {}
+    for key_el in root.findall(f"{prefix}key", ns):
+        key_id = key_el.attrib.get("id", "")
+        key_name = key_el.attrib.get("attr.name") or key_id
+        key_names[key_id] = key_name
+
+    def read_data(element: ET.Element) -> dict[str, str]:
+        data: dict[str, str] = {}
+        for data_el in element.findall(f"{prefix}data", ns):
+            key = key_names.get(data_el.attrib.get("key", ""), data_el.attrib.get("key", ""))
+            data[key] = data_el.text or ""
+        return data
+
+    graph_el = root.find(f"{prefix}graph", ns)
+    if graph_el is None:
+        raise ValueError("GraphML не содержит элемента graph.")
+
+    parsed_nodes = []
+    for node_el in graph_el.findall(f"{prefix}node", ns):
+        node_id = node_el.attrib.get("id", "")
+        data = read_data(node_el)
+        props: dict[str, Any] = {}
+        if data.get("properties_json"):
+            try:
+                props.update(json.loads(data["properties_json"]))
+            except json.JSONDecodeError:
+                props["properties_json"] = data["properties_json"]
+        for key, value in data.items():
+            if key in {"properties_json", "labels"}:
+                continue
+            props.setdefault(key, value)
+        labels_text = data.get("labels", "")
+        labels = [item.strip() for item in labels_text.split(",") if item.strip()] or ["ImportedNode"]
+        parsed_nodes.append({"id": node_id, "labels": labels, "properties": props})
+
+    parsed_edges = []
+    for idx, edge_el in enumerate(graph_el.findall(f"{prefix}edge", ns)):
+        data = read_data(edge_el)
+        props: dict[str, Any] = {}
+        if data.get("properties_json"):
+            try:
+                props.update(json.loads(data["properties_json"]))
+            except json.JSONDecodeError:
+                props["properties_json"] = data["properties_json"]
+        for key, value in data.items():
+            if key in {"properties_json", "type"}:
+                continue
+            props.setdefault(key, value)
+        parsed_edges.append(
+            {
+                "id": edge_el.attrib.get("id", f"edge_{idx}"),
+                "source": edge_el.attrib.get("source", ""),
+                "target": edge_el.attrib.get("target", ""),
+                "type": data.get("type") or edge_el.attrib.get("label") or "IMPORTED_RELATION",
+                "properties": props,
+            }
+        )
+    return {"nodes": parsed_nodes, "edges": parsed_edges, "meta": {"source_format": "graphml"}}
+
+
+def parse_graph_upload(file_name: str, file_bytes: bytes) -> dict[str, Any]:
+    lower_name = file_name.lower()
+    if lower_name.endswith(".json"):
+        return parse_graph_json_upload(file_bytes)
+    if lower_name.endswith(".graphml") or lower_name.endswith(".xml"):
+        return parse_graphml_upload(file_bytes)
+    raise ValueError("Поддерживаются только .json, .graphml и .xml.")
+
+
+def import_graph_to_neo4j(
+    uri: str,
+    user: str,
+    password: str,
+    graph_data: dict[str, Any],
+    namespace: str,
+) -> dict[str, int]:
+    namespace = safe_entity_name(namespace or "imported_graph") or "imported_graph"
+    nodes = graph_data.get("nodes") or []
+    edges = graph_data.get("edges") or []
+    driver = get_neo4j_driver(uri, user, password)
+    created_nodes = 0
+    updated_nodes = 0
+    created_edges = 0
+    skipped_edges = 0
+    try:
+        with driver.session() as session:
+            for node in nodes:
+                original_id = str(node.get("id") or "")
+                if not original_id:
+                    continue
+                labels = [sanitize_node_label(label) for label in (node.get("labels") or ["ImportedNode"])]
+                label_clause = ":".join(dict.fromkeys(["ImportedGraphNode", *labels]))
+                import_key = f"{namespace}::{original_id}"
+                props = coerce_neo4j_properties(node.get("properties") or {})
+                props.update(
+                    {
+                        "import_namespace": namespace,
+                        "import_id": original_id,
+                        "import_key": import_key,
+                        "import_labels_json": json.dumps(node.get("labels") or [], ensure_ascii=False),
+                    }
+                )
+                record = session.run(
+                    f"""
+                    MERGE (n:{label_clause} {{import_key: $import_key}})
+                    ON CREATE SET n.created_at = datetime(), n.import_created = true
+                    ON MATCH SET n.import_created = false
+                    SET n += $props,
+                        n.updated_at = datetime()
+                    RETURN n.import_created AS created
+                    """,
+                    {"import_key": import_key, "props": props},
+                ).single()
+                if record and record["created"]:
+                    created_nodes += 1
+                else:
+                    updated_nodes += 1
+
+            for edge in edges:
+                source_id = str(edge.get("source") or "")
+                target_id = str(edge.get("target") or "")
+                if not source_id or not target_id:
+                    skipped_edges += 1
+                    continue
+                rel_type = sanitize_relation_type(str(edge.get("type") or "IMPORTED_RELATION"))
+                props = coerce_neo4j_properties(edge.get("properties") or {})
+                props.update(
+                    {
+                        "import_namespace": namespace,
+                        "import_id": str(edge.get("id") or ""),
+                        "import_type": str(edge.get("type") or "IMPORTED_RELATION"),
+                    }
+                )
+                record = session.run(
+                    f"""
+                    MATCH (source:ImportedGraphNode {{import_key: $source_key}})
+                    MATCH (target:ImportedGraphNode {{import_key: $target_key}})
+                    MERGE (source)-[r:{rel_type} {{import_namespace: $namespace, import_id: $import_id}}]->(target)
+                    ON CREATE SET r.created_at = datetime(), r.import_created = true
+                    ON MATCH SET r.import_created = false
+                    SET r += $props,
+                        r.updated_at = datetime()
+                    RETURN r.import_created AS created
+                    """,
+                    {
+                        "source_key": f"{namespace}::{source_id}",
+                        "target_key": f"{namespace}::{target_id}",
+                        "namespace": namespace,
+                        "import_id": str(edge.get("id") or f"{source_id}->{target_id}:{rel_type}"),
+                        "props": props,
+                    },
+                ).single()
+                if record is None:
+                    skipped_edges += 1
+                elif record["created"]:
+                    created_edges += 1
+        return {
+            "created_nodes": created_nodes,
+            "updated_nodes": updated_nodes,
+            "created_edges": created_edges,
+            "skipped_edges": skipped_edges,
+        }
+    finally:
+        driver.close()
+
+
+def fetch_neo4j_entity_concept_options(
+    uri: str,
+    user: str,
+    password: str,
+    limit: int,
+    contains: str = "",
+) -> list[dict[str, Any]]:
+    query = """
+    MATCH (c:EntityConcept)
+    WHERE $contains = ""
+       OR toLower(coalesce(c.name, c.norm, "")) CONTAINS toLower($contains)
+       OR toLower(coalesce(c.norm, "")) CONTAINS toLower($contains)
+    OPTIONAL MATCH (c)-[out:RELATION_INSTANCE]->()
+    OPTIONAL MATCH ()-[inn:RELATION_INSTANCE]->(c)
+    OPTIONAL MATCH (occ:FrameOccurrence)-[:OF_CONCEPT]->(c)
+    RETURN
+      c.norm AS norm,
+      coalesce(c.name, c.norm) AS name,
+      count(DISTINCT out) AS out_degree,
+      count(DISTINCT inn) AS in_degree,
+      count(DISTINCT occ) AS frame_count
+    ORDER BY (out_degree + in_degree) DESC, frame_count DESC, name
+    LIMIT $limit
+    """
+    driver = get_neo4j_driver(uri, user, password)
+    try:
+        with driver.session() as session:
+            return [
+                {
+                    "norm": record["norm"] or "",
+                    "name": record["name"] or "",
+                    "out_degree": int(record["out_degree"] or 0),
+                    "in_degree": int(record["in_degree"] or 0),
+                    "frame_count": int(record["frame_count"] or 0),
+                }
+                for record in session.run(query, {"contains": contains, "limit": int(limit)})
+            ]
+    finally:
+        driver.close()
+
+
+def create_approved_concept_relation(
+    uri: str,
+    user: str,
+    password: str,
+    left_norm: str,
+    right_norm: str,
+    relation_kind: str,
+    relation_text: str,
+    note: str = "",
+) -> None:
+    relation_type_map = {
+        "alias": "APPROVED_ALIAS_OF",
+        "broader": "APPROVED_BROADER_THAN",
+        "context": "APPROVED_CONTEXT_LINK",
+        "manual": "MANUAL_CONTEXT_LINK",
+    }
+    rel_type = relation_type_map.get(relation_kind, "MANUAL_CONTEXT_LINK")
+    query = f"""
+    MATCH (left:EntityConcept {{norm: $left_norm}})
+    MATCH (right:EntityConcept {{norm: $right_norm}})
+    MERGE (left)-[rel:{rel_type}]->(right)
+    SET rel.relation_text = $relation_text,
+        rel.note = $note,
+        rel.approved = true,
+        rel.updated_at = datetime()
+    """
+    driver = get_neo4j_driver(uri, user, password)
+    try:
+        with driver.session() as session:
+            session.run(
+                query,
+                {
+                    "left_norm": left_norm,
+                    "right_norm": right_norm,
+                    "relation_text": relation_text,
+                    "note": note,
+                },
+            )
+    finally:
+        driver.close()
+
+
+def create_manual_component_connector(
+    uri: str,
+    user: str,
+    password: str,
+    left_norm: str,
+    right_norm: str,
+    connector_name: str,
+    relation_text: str,
+    auto_name: bool = False,
+    note: str = "",
+) -> dict[str, str]:
+    connector_name = normalize_whitespace(connector_name or "")
+    if not connector_name:
+        connector_name = f"Связка: {relation_text.strip() or 'контекстная связь'}"
+    connector_norm = safe_entity_name(connector_name)
+    query = """
+    MATCH (left:EntityConcept {norm: $left_norm})
+    MATCH (right:EntityConcept {norm: $right_norm})
+    MERGE (connector:EntityConcept {norm: $connector_norm})
+      ON CREATE SET connector.name = $connector_name,
+                    connector.manual = true,
+                    connector.connector = true,
+                    connector.created_at = datetime()
+      ON MATCH SET connector.name = coalesce(connector.name, $connector_name),
+                   connector.manual = true,
+                   connector.connector = true
+    MERGE (left)-[lr:MANUAL_COMPONENT_LINK]->(connector)
+    SET lr.relation_text = $relation_text,
+        lr.note = $note,
+        lr.auto_name = $auto_name,
+        lr.updated_at = datetime()
+    MERGE (connector)-[rr:MANUAL_COMPONENT_LINK]->(right)
+    SET rr.relation_text = $relation_text,
+        rr.note = $note,
+        rr.auto_name = $auto_name,
+        rr.updated_at = datetime()
+    RETURN connector.norm AS connector_norm, connector.name AS connector_name
+    """
+    driver = get_neo4j_driver(uri, user, password)
+    try:
+        with driver.session() as session:
+            record = session.run(
+                query,
+                {
+                    "left_norm": left_norm,
+                    "right_norm": right_norm,
+                    "connector_norm": connector_norm,
+                    "connector_name": connector_name,
+                    "relation_text": relation_text,
+                    "auto_name": bool(auto_name),
+                    "note": note,
+                },
+            ).single()
+            return {
+                "connector_norm": record["connector_norm"] if record else connector_norm,
+                "connector_name": record["connector_name"] if record else connector_name,
+            }
+    finally:
+        driver.close()
+
+
 def fetch_neo4j_triplets(
     uri: str,
     user: str,
@@ -2883,7 +3821,15 @@ def render_neo4j_graph_section() -> None:
 
     graph_mode = st.radio(
         "Режим просмотра графа",
-        options=["Legacy-связи", "Связи концептов", "Контекстные мосты", "Триплеты", "Frame-дерево", "Смешанный граф: триплет + frame"],
+        options=[
+            "Legacy-связи",
+            "Связи концептов",
+            "Контекстные мосты",
+            "Одобренные/ручные связи",
+            "Триплеты",
+            "Frame-дерево",
+            "Смешанный граф: триплет + frame",
+        ],
         index=0,
         key="neo_view_mode",
     )
@@ -3008,6 +3954,14 @@ def render_neo4j_graph_section() -> None:
                     )
                 elif graph_mode == "Контекстные мосты":
                     rows = fetch_neo4j_context_bridges(
+                        uri=uri,
+                        user=user,
+                        password=password,
+                        limit=limit,
+                        contains=contains,
+                    )
+                elif graph_mode == "Одобренные/ручные связи":
+                    rows = fetch_neo4j_approved_context_links(
                         uri=uri,
                         user=user,
                         password=password,
@@ -3146,7 +4100,7 @@ def render_neo4j_graph_section() -> None:
                 st.info("Для текущего фильтра строки не найдены.")
                 return
 
-            if graph_mode in ("Legacy-связи", "Связи концептов", "Контекстные мосты"):
+            if graph_mode in ("Legacy-связи", "Связи концептов", "Контекстные мосты", "Одобренные/ручные связи"):
                 if deduplicate_edges:
                     seen = set()
                     unique_rows = []
@@ -3177,8 +4131,8 @@ def render_neo4j_graph_section() -> None:
                             "source": subj_id,
                             "target": obj_id,
                             "label": row["predicate"],
-                            "color": "#0B8043" if graph_mode == "Контекстные мосты" else None,
-                            "style": "dashed" if graph_mode == "Контекстные мосты" else None,
+                            "color": "#0B8043" if graph_mode == "Контекстные мосты" else "#7B1FA2" if graph_mode == "Одобренные/ручные связи" else None,
+                            "style": "dashed" if graph_mode in ("Контекстные мосты", "Одобренные/ручные связи") else None,
                         }
                     )
                 render_graphviz_from_edges(
@@ -3248,6 +4202,228 @@ def render_neo4j_graph_section() -> None:
         except Exception as exc:
             st.error(f"Ошибка просмотра Neo4j: {exc}")
             st.code(traceback.format_exc(), language="text")
+
+
+def render_graph_export_section() -> None:
+    st.subheader("Выгрузить / загрузить граф")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        uri = st.text_input(
+            "URI Neo4j (выгрузка)",
+            value=st.session_state.get("neo_uri", "bolt://localhost:7687"),
+            key="neo_export_uri",
+        )
+    with c2:
+        user = st.text_input(
+            "Пользователь Neo4j (выгрузка)",
+            value=st.session_state.get("neo_user", "neo4j"),
+            key="neo_export_user",
+        )
+    with c3:
+        password = st.text_input(
+            "Пароль Neo4j (выгрузка)",
+            value=st.session_state.get("neo_password", "neo4jpass"),
+            type="password",
+            key="neo_export_password",
+        )
+
+    c4, c5, c6 = st.columns(3)
+    with c4:
+        contains = st.text_input(
+            "Фильтр по узлам/связям",
+            value="",
+            key="neo_export_filter",
+            help="Пустой фильтр выгружает граф целиком в пределах заданных лимитов.",
+        )
+    with c5:
+        node_limit = st.number_input(
+            "Лимит вершин",
+            min_value=1,
+            max_value=1_000_000,
+            value=50_000,
+            step=1000,
+            key="neo_export_node_limit",
+        )
+    with c6:
+        relation_limit = st.number_input(
+            "Лимит связей",
+            min_value=1,
+            max_value=2_000_000,
+            value=100_000,
+            step=1000,
+            key="neo_export_relation_limit",
+        )
+
+    st.caption(
+        "JSON сохраняет labels/properties для узлов и type/properties для связей. "
+        "GraphML подходит для Gephi, yEd и NetworkX; свойства упакованы в properties_json."
+    )
+
+    export_tab, import_tab = st.tabs(["Выгрузка", "Загрузка"])
+
+    with import_tab:
+        st.caption(
+            "Импорт создаёт отдельные ImportedGraphNode-узлы с import_namespace/import_id. "
+            "Существующий граф не удаляется."
+        )
+        uploaded_graph = st.file_uploader(
+            "Загрузите JSON/GraphML граф",
+            type=["json", "graphml", "xml"],
+            key="neo_graph_import_upload",
+            accept_multiple_files=False,
+        )
+        import_namespace = st.text_input(
+            "Namespace импорта",
+            value="imported_graph",
+            key="neo_graph_import_namespace",
+            help="Одинаковый namespace обновляет ранее импортированные узлы/связи с теми же id.",
+        )
+        with st.expander("Ожидаемый формат JSON/GraphML", expanded=False):
+            st.markdown(
+                """
+JSON:
+```json
+{
+  "nodes": [
+    {
+      "id": "node-1",
+      "labels": ["EntityConcept"],
+      "properties": {"name": "угол", "norm": "угол"}
+    }
+  ],
+  "edges": [
+    {
+      "id": "edge-1",
+      "source": "node-1",
+      "target": "node-2",
+      "type": "RELATION_INSTANCE",
+      "properties": {"predicate": "характеризует"}
+    }
+  ]
+}
+```
+
+GraphML:
+```xml
+<graphml>
+  <graph edgedefault="directed">
+    <node id="n0">
+      <data key="labels">EntityConcept</data>
+      <data key="properties_json">{"name": "угол"}</data>
+    </node>
+    <edge id="e0" source="n0" target="n1">
+      <data key="type">RELATION_INSTANCE</data>
+      <data key="properties_json">{"predicate": "характеризует"}</data>
+    </edge>
+  </graph>
+</graphml>
+```
+                """
+            )
+        if uploaded_graph is not None:
+            try:
+                parsed_graph = parse_graph_upload(uploaded_graph.name, uploaded_graph.getvalue())
+                st.write(
+                    f"Файл прочитан: вершин={len(parsed_graph.get('nodes', []))}, "
+                    f"связей={len(parsed_graph.get('edges', []))}."
+                )
+                preview_nodes = parsed_graph.get("nodes", [])[:10]
+                preview_edges = parsed_graph.get("edges", [])[:10]
+                p1, p2 = st.tabs(["Пример вершин", "Пример связей"])
+                with p1:
+                    st.dataframe(pd.DataFrame(preview_nodes), use_container_width=True)
+                with p2:
+                    st.dataframe(pd.DataFrame(preview_edges), use_container_width=True)
+                if st.button("Загрузить граф в Neo4j", type="primary", key="neo_graph_import_btn"):
+                    with st.spinner("Создаю граф в Neo4j..."):
+                        stats = import_graph_to_neo4j(
+                            uri=uri,
+                            user=user,
+                            password=password,
+                            graph_data=parsed_graph,
+                            namespace=import_namespace,
+                        )
+                    st.success(
+                        f"Импорт завершён: создано вершин={stats['created_nodes']}, "
+                        f"обновлено вершин={stats['updated_nodes']}, "
+                        f"создано связей={stats['created_edges']}, "
+                        f"пропущено связей={stats['skipped_edges']}."
+                    )
+            except Exception as exc:
+                st.error(f"Не удалось прочитать или загрузить граф: {exc}")
+                st.code(traceback.format_exc(), language="text")
+
+    with export_tab:
+        if "neo_graph_export_data" not in st.session_state:
+            st.session_state["neo_graph_export_data"] = None
+
+        if st.button("Выгрузить граф из Neo4j", type="primary", key="neo_export_btn"):
+            try:
+                with st.spinner("Выгружаю граф из Neo4j..."):
+                    st.session_state["neo_graph_export_data"] = fetch_neo4j_full_graph_export(
+                        uri=uri,
+                        user=user,
+                        password=password,
+                        node_limit=int(node_limit),
+                        relation_limit=int(relation_limit),
+                        contains=contains.strip(),
+                    )
+                st.success("Граф подготовлен к скачиванию.")
+            except Exception as exc:
+                st.error(f"Ошибка выгрузки графа: {exc}")
+                st.code(traceback.format_exc(), language="text")
+                return
+
+        graph_data = st.session_state.get("neo_graph_export_data")
+        if not graph_data:
+            st.info("Нажмите кнопку выгрузки, чтобы подготовить JSON/GraphML.")
+            return
+
+        meta = graph_data.get("meta") or {}
+        st.write(
+            f"Выгружено: вершин={meta.get('node_count', 0)}, "
+            f"связей={meta.get('edge_count', 0)}, "
+            f"пропущено связей вне лимита вершин={meta.get('skipped_edges_outside_node_limit', 0)}."
+        )
+        if meta.get("skipped_edges_outside_node_limit", 0):
+            st.warning(
+                "Часть связей не попала в экспорт, потому что один из концов связи оказался вне лимита вершин. "
+                "Увеличьте лимит вершин или сузьте фильтр."
+            )
+
+        sample_nodes = graph_data.get("nodes", [])[:20]
+        sample_edges = graph_data.get("edges", [])[:20]
+        preview_tab_nodes, preview_tab_edges = st.tabs(["Первые вершины", "Первые связи"])
+        with preview_tab_nodes:
+            if sample_nodes:
+                st.dataframe(pd.DataFrame(sample_nodes), use_container_width=True)
+            else:
+                st.info("Вершины не найдены.")
+        with preview_tab_edges:
+            if sample_edges:
+                st.dataframe(pd.DataFrame(sample_edges), use_container_width=True)
+            else:
+                st.info("Связи не найдены.")
+
+        json_bytes = graph_export_to_json_bytes(graph_data)
+        graphml_bytes = graph_export_to_graphml_bytes(graph_data)
+        d1, d2 = st.columns(2)
+        with d1:
+            st.download_button(
+                "Скачать JSON",
+                data=json_bytes,
+                file_name="neo4j_graph_export.json",
+                mime="application/json",
+                key="download_graph_json",
+            )
+        with d2:
+            st.download_button(
+                "Скачать GraphML",
+                data=graphml_bytes,
+                file_name="neo4j_graph_export.graphml",
+                mime="application/graphml+xml",
+                key="download_graph_graphml",
+            )
 
 
 def main() -> None:
@@ -3344,8 +4520,8 @@ def main() -> None:
                 key_prefix="processed_result",
             )
 
-    tab_storage, tab_pg, tab_concepts, tab_analytics, tab_neo = st.tabs(
-        ["Сохранение", "PostgreSQL", "Концепты", "Аналитика", "Neo4j"]
+    tab_storage, tab_pg, tab_concepts, tab_analytics, tab_export, tab_neo = st.tabs(
+        ["Сохранение", "PostgreSQL", "Концепты", "Аналитика", "Выгрузить граф", "Neo4j"]
     )
     with tab_storage:
         render_storage_section()
@@ -3356,6 +4532,8 @@ def main() -> None:
         render_concept_aliases_section()
     with tab_analytics:
         render_graph_analytics_section()
+    with tab_export:
+        render_graph_export_section()
     with tab_neo:
         render_neo4j_graph_section()
 
