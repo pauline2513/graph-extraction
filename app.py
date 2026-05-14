@@ -820,24 +820,25 @@ def render_storage_section() -> None:
             st.error(f"Ошибка сохранения в БД: {exc}")
             st.code(traceback.format_exc(), language="text")
 
-    st.caption("Кандидаты в алиасы из frame-контекста Neo4j")
+    st.caption("Кандидаты в алиасы/слияние по embedding-похожести вершин EntityConcept")
     a1, a2, a3 = st.columns(3)
     with a1:
         alias_min_support = st.number_input(
-            "Минимальная поддержка",
+            "Мин. встречаемость вершины",
             min_value=1,
             max_value=100,
-            value=3,
+            value=1,
             step=1,
             key="alias_min_support",
+            help="Вершины с меньшим числом FrameOccurrence не попадают в сравнение. Сами кандидаты ранжируются по embedding similarity вершин.",
         )
     with a2:
         alias_min_conf = st.number_input(
-            "Минимальная уверенность",
+            "Мин. cosine similarity",
             min_value=0.0,
             max_value=1.0,
-            value=0.55,
-            step=0.05,
+            value=0.82,
+            step=0.01,
             key="alias_min_conf",
         )
     with a3:
@@ -850,7 +851,7 @@ def render_storage_section() -> None:
             key="alias_limit",
         )
 
-    if st.button("Найти кандидатов в алиасы", key="mine_alias_candidates_btn"):
+    if st.button("Найти кандидатов по вершинам", key="mine_alias_candidates_btn"):
         pg_cfg = {
             "host": pg_host,
             "port": pg_port,
@@ -860,7 +861,7 @@ def render_storage_section() -> None:
         }
         neo_cfg = {"uri": neo_uri, "user": neo_user, "password": neo_password}
         try:
-            with st.spinner("Ищу кандидатов в алиасы в Neo4j..."):
+            with st.spinner("Сравниваю вершины EntityConcept по эмбеддингам..."):
                 rows = mine_alias_candidates(
                     pg_cfg=pg_cfg,
                     neo_cfg=neo_cfg,
@@ -1756,209 +1757,209 @@ def render_documents_list_section() -> None:
                     st.code(traceback.format_exc(), language="text")
 
 
-def render_concept_aliases_section() -> None:
-    st.subheader("Алиасы концептов")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        host = st.text_input(
-            "Хост PostgreSQL (концепты)",
-            value=st.session_state.get("pg_host", "127.0.0.1"),
-            key="pg_concepts_host",
-        )
-    with c2:
-        port = st.text_input(
-            "Порт PostgreSQL (концепты)",
-            value=st.session_state.get("pg_port", "5433"),
-            key="pg_concepts_port",
-        )
-    with c3:
-        dbname = st.text_input(
-            "База PostgreSQL (концепты)",
-            value=st.session_state.get("pg_db", "triplets"),
-            key="pg_concepts_db",
-        )
+# def render_concept_aliases_section() -> None:
+#     st.subheader("Алиасы концептов")
+#     c1, c2, c3 = st.columns(3)
+#     with c1:
+#         host = st.text_input(
+#             "Хост PostgreSQL (концепты)",
+#             value=st.session_state.get("pg_host", "127.0.0.1"),
+#             key="pg_concepts_host",
+#         )
+#     with c2:
+#         port = st.text_input(
+#             "Порт PostgreSQL (концепты)",
+#             value=st.session_state.get("pg_port", "5433"),
+#             key="pg_concepts_port",
+#         )
+#     with c3:
+#         dbname = st.text_input(
+#             "База PostgreSQL (концепты)",
+#             value=st.session_state.get("pg_db", "triplets"),
+#             key="pg_concepts_db",
+#         )
 
-    c4, c5, c6 = st.columns(3)
-    with c4:
-        user = st.text_input(
-            "Пользователь PostgreSQL (концепты)",
-            value=st.session_state.get("pg_user", "triplets_user"),
-            key="pg_concepts_user",
-        )
-    with c5:
-        password = st.text_input(
-            "Пароль PostgreSQL (концепты)",
-            value=st.session_state.get("pg_password", "triplets_pass"),
-            type="password",
-            key="pg_concepts_password",
-        )
-    with c6:
-        alias_limit = st.slider(
-            "Макс. алиасов",
-            min_value=20,
-            max_value=1000,
-            value=200,
-            step=20,
-            key="pg_concepts_limit",
-        )
+#     c4, c5, c6 = st.columns(3)
+#     with c4:
+#         user = st.text_input(
+#             "Пользователь PostgreSQL (концепты)",
+#             value=st.session_state.get("pg_user", "triplets_user"),
+#             key="pg_concepts_user",
+#         )
+#     with c5:
+#         password = st.text_input(
+#             "Пароль PostgreSQL (концепты)",
+#             value=st.session_state.get("pg_password", "triplets_pass"),
+#             type="password",
+#             key="pg_concepts_password",
+#         )
+#     with c6:
+#         alias_limit = st.slider(
+#             "Макс. алиасов",
+#             min_value=20,
+#             max_value=1000,
+#             value=200,
+#             step=20,
+#             key="pg_concepts_limit",
+#         )
 
-    c7, c8 = st.columns(2)
-    with c7:
-        status_filter = st.selectbox(
-            "Статус алиаса",
-            options=["candidate", "approved", "rejected", "all"],
-            index=0,
-            key="concept_alias_status_filter",
-        )
-    with c8:
-        concepts_limit = st.slider(
-            "Макс. концептов",
-            min_value=20,
-            max_value=2000,
-            value=500,
-            step=20,
-            key="concepts_limit",
-        )
+#     c7, c8 = st.columns(2)
+#     with c7:
+#         status_filter = st.selectbox(
+#             "Статус алиаса",
+#             options=["candidate", "approved", "rejected", "all"],
+#             index=0,
+#             key="concept_alias_status_filter",
+#         )
+#     with c8:
+#         concepts_limit = st.slider(
+#             "Макс. концептов",
+#             min_value=20,
+#             max_value=2000,
+#             value=500,
+#             step=20,
+#             key="concepts_limit",
+#         )
 
-    pg_cfg = {
-        "host": host,
-        "port": port,
-        "dbname": dbname,
-        "user": user,
-        "password": password,
-    }
+#     pg_cfg = {
+#         "host": host,
+#         "port": port,
+#         "dbname": dbname,
+#         "user": user,
+#         "password": password,
+#     }
 
-    if "concept_alias_rows" not in st.session_state:
-        st.session_state["concept_alias_rows"] = []
-    if "concept_rows" not in st.session_state:
-        st.session_state["concept_rows"] = []
+#     if "concept_alias_rows" not in st.session_state:
+#         st.session_state["concept_alias_rows"] = []
+#     if "concept_rows" not in st.session_state:
+#         st.session_state["concept_rows"] = []
 
-    def refresh_concept_state() -> None:
-        st.session_state["concept_alias_rows"] = fetch_concept_aliases(
-            pg_cfg,
-            status_filter=status_filter,
-            limit=alias_limit,
-        )
-        st.session_state["concept_rows"] = fetch_concepts(pg_cfg, limit=concepts_limit)
+#     def refresh_concept_state() -> None:
+#         st.session_state["concept_alias_rows"] = fetch_concept_aliases(
+#             pg_cfg,
+#             status_filter=status_filter,
+#             limit=alias_limit,
+#         )
+#         st.session_state["concept_rows"] = fetch_concepts(pg_cfg, limit=concepts_limit)
 
-    if st.button("Загрузить алиасы концептов", key="load_concept_aliases_btn"):
-        try:
-            with st.spinner("Загружаю концепты и алиасы..."):
-                refresh_concept_state()
-            st.success(
-                f"Загружено алиасов: {len(st.session_state['concept_alias_rows'])}, "
-                f"концептов: {len(st.session_state['concept_rows'])}"
-            )
-        except Exception as exc:
-            st.error(f"Ошибка загрузки алиасов концептов: {exc}")
-            st.code(traceback.format_exc(), language="text")
+#     if st.button("Загрузить алиасы концептов", key="load_concept_aliases_btn"):
+#         try:
+#             with st.spinner("Загружаю концепты и алиасы..."):
+#                 refresh_concept_state()
+#             st.success(
+#                 f"Загружено алиасов: {len(st.session_state['concept_alias_rows'])}, "
+#                 f"концептов: {len(st.session_state['concept_rows'])}"
+#             )
+#         except Exception as exc:
+#             st.error(f"Ошибка загрузки алиасов концептов: {exc}")
+#             st.code(traceback.format_exc(), language="text")
 
-    alias_rows = st.session_state["concept_alias_rows"]
-    concept_rows = st.session_state["concept_rows"]
+#     alias_rows = st.session_state["concept_alias_rows"]
+#     concept_rows = st.session_state["concept_rows"]
 
-    if alias_rows:
-        st.dataframe(pd.DataFrame(alias_rows), use_container_width=True)
+#     if alias_rows:
+#         st.dataframe(pd.DataFrame(alias_rows), use_container_width=True)
 
-        alias_labels = [
-            (
-                f"{row['alias_id']} | concept={row['concept_id']} | "
-                f"{row['canonical_name']} <- {row['alias_text']} | "
-                f"status={row['status']} | conf={row['confidence'] if row['confidence'] is not None else 'n/a'}"
-            )
-            for row in alias_rows
-        ]
-        selected_alias_label = st.selectbox(
-            "Алиас для проверки",
-            options=alias_labels,
-            key="concept_alias_select",
-        )
-        selected_alias_id = int(selected_alias_label.split("|", 1)[0].strip())
-        review_note = st.text_input("Комментарий ревью", value="", key="concept_alias_review_note")
+#         alias_labels = [
+#             (
+#                 f"{row['alias_id']} | concept={row['concept_id']} | "
+#                 f"{row['canonical_name']} <- {row['alias_text']} | "
+#                 f"status={row['status']} | conf={row['confidence'] if row['confidence'] is not None else 'n/a'}"
+#             )
+#             for row in alias_rows
+#         ]
+#         selected_alias_label = st.selectbox(
+#             "Алиас для проверки",
+#             options=alias_labels,
+#             key="concept_alias_select",
+#         )
+#         selected_alias_id = int(selected_alias_label.split("|", 1)[0].strip())
+#         review_note = st.text_input("Комментарий ревью", value="", key="concept_alias_review_note")
 
-        b1, b2, b3 = st.columns(3)
-        with b1:
-            approve_clicked = st.button("Одобрить алиас", key="approve_alias_btn")
-        with b2:
-            reject_clicked = st.button("Отклонить алиас", key="reject_alias_btn")
-        with b3:
-            reset_clicked = st.button("Вернуть в кандидаты", key="reset_alias_btn")
+#         b1, b2, b3 = st.columns(3)
+#         with b1:
+#             approve_clicked = st.button("Одобрить алиас", key="approve_alias_btn")
+#         with b2:
+#             reject_clicked = st.button("Отклонить алиас", key="reject_alias_btn")
+#         with b3:
+#             reset_clicked = st.button("Вернуть в кандидаты", key="reset_alias_btn")
 
-        try:
-            if approve_clicked:
-                with st.spinner("Одобряю алиас..."):
-                    result = update_concept_alias_status(
-                        pg_cfg=pg_cfg,
-                        alias_id=selected_alias_id,
-                        status="approved",
-                        review_note=review_note,
-                    )
-                    refresh_concept_state()
-                st.success(f"Алиас одобрен: {result['alias_text']} -> concept_id={result['concept_id']}")
-            if reject_clicked:
-                with st.spinner("Отклоняю алиас..."):
-                    result = update_concept_alias_status(
-                        pg_cfg=pg_cfg,
-                        alias_id=selected_alias_id,
-                        status="rejected",
-                        review_note=review_note,
-                    )
-                    refresh_concept_state()
-                st.success(f"Алиас отклонён: {result['alias_text']}")
-            if reset_clicked:
-                with st.spinner("Сбрасываю статус алиаса..."):
-                    result = update_concept_alias_status(
-                        pg_cfg=pg_cfg,
-                        alias_id=selected_alias_id,
-                        status="candidate",
-                        review_note=review_note,
-                    )
-                    refresh_concept_state()
-                st.success(f"Алиас возвращён в кандидаты: {result['alias_text']}")
-        except Exception as exc:
-            st.error(f"Ошибка ревью алиаса: {exc}")
-            st.code(traceback.format_exc(), language="text")
-    else:
-        st.info("Загрузите алиасы концептов, чтобы проверить кандидатные соответствия.")
+#         try:
+#             if approve_clicked:
+#                 with st.spinner("Одобряю алиас..."):
+#                     result = update_concept_alias_status(
+#                         pg_cfg=pg_cfg,
+#                         alias_id=selected_alias_id,
+#                         status="approved",
+#                         review_note=review_note,
+#                     )
+#                     refresh_concept_state()
+#                 st.success(f"Алиас одобрен: {result['alias_text']} -> concept_id={result['concept_id']}")
+#             if reject_clicked:
+#                 with st.spinner("Отклоняю алиас..."):
+#                     result = update_concept_alias_status(
+#                         pg_cfg=pg_cfg,
+#                         alias_id=selected_alias_id,
+#                         status="rejected",
+#                         review_note=review_note,
+#                     )
+#                     refresh_concept_state()
+#                 st.success(f"Алиас отклонён: {result['alias_text']}")
+#             if reset_clicked:
+#                 with st.spinner("Сбрасываю статус алиаса..."):
+#                     result = update_concept_alias_status(
+#                         pg_cfg=pg_cfg,
+#                         alias_id=selected_alias_id,
+#                         status="candidate",
+#                         review_note=review_note,
+#                     )
+#                     refresh_concept_state()
+#                 st.success(f"Алиас возвращён в кандидаты: {result['alias_text']}")
+#         except Exception as exc:
+#             st.error(f"Ошибка ревью алиаса: {exc}")
+#             st.code(traceback.format_exc(), language="text")
+#     else:
+#         st.info("Загрузите алиасы концептов, чтобы проверить кандидатные соответствия.")
 
-    if concept_rows:
-        st.caption("Слияние концептов")
-        st.dataframe(pd.DataFrame(concept_rows), use_container_width=True)
-        concept_labels = [
-            (
-                f"{row['concept_id']} | {row['canonical_name']} | "
-                f"aliases={row['alias_count']} | approved={row['approved_aliases']}"
-            )
-            for row in concept_rows
-        ]
-        source_label = st.selectbox("Исходный концепт", options=concept_labels, key="merge_source_concept")
-        target_label = st.selectbox("Целевой концепт", options=concept_labels, key="merge_target_concept")
-        merge_note = st.text_input("Комментарий к слиянию", value="", key="merge_concept_note")
-        merge_confirm = st.checkbox("Подтвердить слияние концептов", value=False, key="merge_concept_confirm")
-        if st.button("Слить концепты", key="merge_concepts_btn"):
-            if not merge_confirm:
-                st.warning("Включите подтверждение перед слиянием концептов.")
-            else:
-                source_concept_id = int(source_label.split("|", 1)[0].strip())
-                target_concept_id = int(target_label.split("|", 1)[0].strip())
-                try:
-                    with st.spinner("Сливаю концепты..."):
-                        stats = merge_concepts(
-                            pg_cfg=pg_cfg,
-                            source_concept_id=source_concept_id,
-                            target_concept_id=target_concept_id,
-                            review_note=merge_note,
-                        )
-                        refresh_concept_state()
-                    st.success(
-                        f"Концепт '{stats['source_name']}' слит в '{stats['target_name']}'. "
-                        f"Удалено алиасов исходного концепта: {stats['deleted_aliases']}, "
-                        f"перенесено ссылок на узлы: {stats['links_moved']}."
-                    )
-                except Exception as exc:
-                    st.error(f"Ошибка слияния концептов: {exc}")
-                    st.code(traceback.format_exc(), language="text")
-    else:
-        st.info("Загрузите концепты, чтобы проверить их или слить.")
+#     if concept_rows:
+#         st.caption("Слияние концептов")
+#         st.dataframe(pd.DataFrame(concept_rows), use_container_width=True)
+#         concept_labels = [
+#             (
+#                 f"{row['concept_id']} | {row['canonical_name']} | "
+#                 f"aliases={row['alias_count']} | approved={row['approved_aliases']}"
+#             )
+#             for row in concept_rows
+#         ]
+#         source_label = st.selectbox("Исходный концепт", options=concept_labels, key="merge_source_concept")
+#         target_label = st.selectbox("Целевой концепт", options=concept_labels, key="merge_target_concept")
+#         merge_note = st.text_input("Комментарий к слиянию", value="", key="merge_concept_note")
+#         merge_confirm = st.checkbox("Подтвердить слияние концептов", value=False, key="merge_concept_confirm")
+#         if st.button("Слить концепты", key="merge_concepts_btn"):
+#             if not merge_confirm:
+#                 st.warning("Включите подтверждение перед слиянием концептов.")
+#             else:
+#                 source_concept_id = int(source_label.split("|", 1)[0].strip())
+#                 target_concept_id = int(target_label.split("|", 1)[0].strip())
+#                 try:
+#                     with st.spinner("Сливаю концепты..."):
+#                         stats = merge_concepts(
+#                             pg_cfg=pg_cfg,
+#                             source_concept_id=source_concept_id,
+#                             target_concept_id=target_concept_id,
+#                             review_note=merge_note,
+#                         )
+#                         refresh_concept_state()
+#                     st.success(
+#                         f"Концепт '{stats['source_name']}' слит в '{stats['target_name']}'. "
+#                         f"Удалено алиасов исходного концепта: {stats['deleted_aliases']}, "
+#                         f"перенесено ссылок на узлы: {stats['links_moved']}."
+#                     )
+#                 except Exception as exc:
+#                     st.error(f"Ошибка слияния концептов: {exc}")
+#                     st.code(traceback.format_exc(), language="text")
+#     else:
+#         st.info("Загрузите концепты, чтобы проверить их или слить.")
 
 
 def format_concept_option(row: dict[str, Any]) -> str:
@@ -1971,12 +1972,44 @@ def format_concept_option(row: dict[str, Any]) -> str:
 def render_context_merge_tools(uri: str, user: str, password: str, analytics_result: dict[str, Any] | None) -> None:
     st.subheader("Ревью и ручное связывание концептов")
     st.caption(
-        "Одобренные связи не удаляют вершины: они фиксируют решение ревью и сохраняют исходные frame-свидетельства."
+        "Одобренные связи не удаляют вершины: они фиксируют решение ревью и сохраняют исходные frame."
     )
 
     if analytics_result:
+        legacy_root_rows = analytics_result.get("legacy_root_rows") or []
+        legacy_root_groups: list[dict[str, Any]] = []
+        groups_by_root: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in legacy_root_rows:
+            root_name = row.get("root_name") or row.get("root_norm") or ""
+            root_norm = row.get("root_norm") or safe_entity_name(root_name)
+            key = (root_norm, root_name)
+            group = groups_by_root.setdefault(
+                key,
+                {
+                    "root_norm": root_norm,
+                    "root_name": root_name,
+                    "cluster_score": row.get("cluster_score", 0.0),
+                    "cluster_size": row.get("cluster_size", 0),
+                    "shared_examples": row.get("shared_examples", ""),
+                    "children": [],
+                },
+            )
+            group["children"].append(
+                {
+                    "child_norm": row.get("child_norm", ""),
+                    "child_name": row.get("child_name") or row.get("child_norm", ""),
+                    "cluster_score": row.get("cluster_score", 0.0),
+                    "shared_examples": row.get("shared_examples", ""),
+                }
+            )
+            group["cluster_score"] = max(float(group.get("cluster_score") or 0.0), float(row.get("cluster_score") or 0.0))
+            group["cluster_size"] = max(int(group.get("cluster_size") or 0), int(row.get("cluster_size") or 0))
+        legacy_root_groups = sorted(
+            groups_by_root.values(),
+            key=lambda item: (-float(item.get("cluster_score") or 0.0), -len(item.get("children") or []), item.get("root_name", "")),
+        )
         candidate_groups = {
-            "Синонимия по контексту": analytics_result.get("synonym_rows") or [],
+            "Синонимия по контексту": legacy_root_groups,
             "Мост между компонентами": analytics_result.get("bridge_rows") or [],
         }
         candidate_kind = st.selectbox(
@@ -1986,45 +2019,110 @@ def render_context_merge_tools(uri: str, user: str, password: str, analytics_res
         )
         candidates = candidate_groups[candidate_kind]
         if candidates:
-            labels = [
-                (
-                    f"{idx + 1}. {row['left_name']} -> {row['right_name']} | "
-                    f"score={row.get('combined_score', row.get('bridge_score', ''))}"
-                )
-                for idx, row in enumerate(candidates)
-            ]
-            selected_label = st.selectbox(
-                "Кандидат из последней аналитики",
-                options=labels,
-                key="context_merge_candidate_select",
-            )
-            selected_idx = labels.index(selected_label)
-            selected_row = candidates[selected_idx]
-            st.dataframe(pd.DataFrame([selected_row]), use_container_width=True)
-            review_note = st.text_input("Комментарий ревью", value="", key="context_merge_candidate_note")
-            relation_kind = "alias" if candidate_kind == "Синонимия по контексту" else "context"
-            default_relation = "алиас" if relation_kind == "alias" else "контекстная связь"
-            relation_text = st.text_input(
-                "Подпись одобренной связи",
-                value=default_relation,
-                key="context_merge_candidate_relation_text",
-            )
-            if st.button("Одобрить выбранную связь", key="approve_context_candidate_btn"):
-                try:
-                    create_approved_concept_relation(
-                        uri=uri,
-                        user=user,
-                        password=password,
-                        left_norm=selected_row["left_norm"],
-                        right_norm=selected_row["right_norm"],
-                        relation_kind=relation_kind,
-                        relation_text=relation_text.strip() or default_relation,
-                        note=review_note.strip(),
+            if candidate_kind == "Синонимия по контексту":
+                labels = [
+                    (
+                        f"{idx + 1}. {row['root_name']} -> {len(row.get('children') or [])} сущн. | "
+                        f"score={row.get('cluster_score', '')}"
                     )
-                    st.success("Одобренная связь записана в Neo4j.")
-                except Exception as exc:
-                    st.error(f"Не удалось записать одобренную связь: {exc}")
-                    st.code(traceback.format_exc(), language="text")
+                    for idx, row in enumerate(candidates)
+                ]
+                selected_label = st.selectbox(
+                    "Кластер из общих legacy-сущностей",
+                    options=labels,
+                    key="context_merge_legacy_root_select",
+                )
+                selected_idx = labels.index(selected_label)
+                selected_row = candidates[selected_idx]
+                child_rows = selected_row.get("children") or []
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "root_name": selected_row.get("root_name", ""),
+                                "child_name": child.get("child_name", ""),
+                                "cluster_score": child.get("cluster_score", selected_row.get("cluster_score", "")),
+                                "shared_examples": child.get("shared_examples", selected_row.get("shared_examples", "")),
+                            }
+                            for child in child_rows
+                        ]
+                    ),
+                    use_container_width=True,
+                )
+                root_name = st.text_input(
+                    "Название новой компоненты",
+                    value=selected_row.get("root_name", ""),
+                    key=f"context_merge_root_name_{selected_idx}",
+                    help="Это изначальное название из root_name. Его можно поправить перед записью.",
+                )
+                relation_text = st.text_input(
+                    "Подпись связей от компоненты",
+                    value="синонимия по контексту",
+                    key="context_merge_legacy_relation_text",
+                )
+                review_note = st.text_input("Комментарий ревью", value="", key="context_merge_legacy_note")
+                if st.button("Создать компоненту и связать сущности", key="approve_context_legacy_root_btn"):
+                    if not root_name.strip():
+                        st.warning("Заполните название новой компоненты.")
+                    elif not child_rows:
+                        st.warning("В выбранном кластере нет дочерних сущностей.")
+                    else:
+                        try:
+                            created = create_context_synonym_component(
+                                uri=uri,
+                                user=user,
+                                password=password,
+                                root_name=root_name,
+                                child_rows=child_rows,
+                                relation_text=relation_text.strip() or "синонимия по контексту",
+                                note=review_note.strip(),
+                            )
+                            st.success(
+                                f"Компонента '{created['root_name']}' записана. "
+                                f"Связей создано/обновлено: {created['linked_count']}."
+                            )
+                        except Exception as exc:
+                            st.error(f"Не удалось записать компоненту синонимии: {exc}")
+                            st.code(traceback.format_exc(), language="text")
+            else:
+                labels = [
+                    (
+                        f"{idx + 1}. {row['left_name']} -> {row['right_name']} | "
+                        f"score={row.get('combined_score', row.get('bridge_score', ''))}"
+                    )
+                    for idx, row in enumerate(candidates)
+                ]
+                selected_label = st.selectbox(
+                    "Кандидат из последней аналитики",
+                    options=labels,
+                    key="context_merge_candidate_select",
+                )
+                selected_idx = labels.index(selected_label)
+                selected_row = candidates[selected_idx]
+                st.dataframe(pd.DataFrame([selected_row]), use_container_width=True)
+                review_note = st.text_input("Комментарий ревью", value="", key="context_merge_candidate_note")
+                default_relation = "контекстная связь"
+                relation_text = st.text_input(
+                    "Подпись одобренной связи",
+                    value=default_relation,
+                    key="context_merge_candidate_relation_text",
+                )
+                if st.button("Одобрить выбранную связь", key="approve_context_candidate_btn"):
+                    try:
+                        create_approved_concept_relation(
+                            uri=uri,
+                            user=user,
+                            password=password,
+                            left_norm=selected_row["left_norm"],
+                            right_norm=selected_row["right_norm"],
+                            relation_kind="context",
+                            relation_text=relation_text.strip() or default_relation,
+                            note=review_note.strip(),
+                        )
+                        st.success("Одобренная связь записана в Neo4j.")
+                    except Exception as exc:
+                        st.error(f"Не удалось записать одобренную связь: {exc}")
+                        st.code(traceback.format_exc(), language="text")
         else:
             st.info("В последней аналитике нет кандидатов выбранного типа.")
     else:
@@ -3556,6 +3654,83 @@ def create_approved_concept_relation(
         driver.close()
 
 
+def create_context_synonym_component(
+    uri: str,
+    user: str,
+    password: str,
+    root_name: str,
+    child_rows: list[dict[str, Any]],
+    relation_text: str,
+    note: str = "",
+) -> dict[str, Any]:
+    root_name = normalize_whitespace(root_name)
+    root_norm = safe_entity_name(root_name)
+    children = []
+    seen_child_norms = set()
+    for row in child_rows:
+        child_name = normalize_whitespace(row.get("child_name") or row.get("child_norm") or "")
+        child_norm = normalize_whitespace(row.get("child_norm") or safe_entity_name(child_name))
+        if not child_norm or child_norm == root_norm or child_norm in seen_child_norms:
+            continue
+        seen_child_norms.add(child_norm)
+        children.append(
+            {
+                "child_norm": child_norm,
+                "child_name": child_name or child_norm,
+                "cluster_score": float(row.get("cluster_score") or 0.0),
+                "shared_examples": row.get("shared_examples", ""),
+            }
+        )
+
+    query = """
+    MERGE (root:EntityConcept {norm: $root_norm})
+      ON CREATE SET root.name = $root_name,
+                    root.manual = true,
+                    root.context_component = true,
+                    root.created_at = datetime()
+      ON MATCH SET root.name = $root_name,
+                   root.manual = true,
+                   root.context_component = true,
+                   root.updated_at = datetime()
+    WITH root
+    UNWIND $children AS child_data
+    MERGE (child:EntityConcept {norm: child_data.child_norm})
+      ON CREATE SET child.name = child_data.child_name,
+                    child.created_from_legacy_context = true,
+                    child.created_at = datetime()
+      ON MATCH SET child.name = coalesce(child.name, child_data.child_name)
+    MERGE (root)-[rel:APPROVED_ALIAS_OF]->(child)
+    SET rel.relation_text = $relation_text,
+        rel.note = $note,
+        rel.approved = true,
+        rel.source = "legacy_context_root",
+        rel.cluster_score = child_data.cluster_score,
+        rel.shared_examples = child_data.shared_examples,
+        rel.updated_at = datetime()
+    RETURN root.norm AS root_norm, root.name AS root_name, count(rel) AS linked_count
+    """
+    driver = get_neo4j_driver(uri, user, password)
+    try:
+        with driver.session() as session:
+            record = session.run(
+                query,
+                {
+                    "root_norm": root_norm,
+                    "root_name": root_name,
+                    "children": children,
+                    "relation_text": relation_text,
+                    "note": note,
+                },
+            ).single()
+            return {
+                "root_norm": record["root_norm"] if record else root_norm,
+                "root_name": record["root_name"] if record else root_name,
+                "linked_count": int(record["linked_count"]) if record else 0,
+            }
+    finally:
+        driver.close()
+
+
 def create_manual_component_connector(
     uri: str,
     user: str,
@@ -3823,7 +3998,7 @@ def render_neo4j_graph_section() -> None:
         "Режим просмотра графа",
         options=[
             "Legacy-связи",
-            "Связи концептов",
+            # "Связи концептов",
             "Контекстные мосты",
             "Одобренные/ручные связи",
             "Триплеты",
@@ -3837,7 +4012,7 @@ def render_neo4j_graph_section() -> None:
     selected_triplet_id: int | None = None
     selected_role = "subject"
 
-    use_document_filter = graph_mode in ("Legacy-связи", "Связи концептов", "Триплеты")
+    use_document_filter = graph_mode in ("Legacy-связи", "Триплеты") #"Связи концептов"
     if use_document_filter:
         doc_filter_mode = st.radio(
             "Режим фильтрации по документу",
@@ -4520,16 +4695,19 @@ def main() -> None:
                 key_prefix="processed_result",
             )
 
-    tab_storage, tab_pg, tab_concepts, tab_analytics, tab_export, tab_neo = st.tabs(
-        ["Сохранение", "PostgreSQL", "Концепты", "Аналитика", "Выгрузить граф", "Neo4j"]
+    # tab_storage, tab_pg, tab_concepts, tab_analytics, tab_export, tab_neo = st.tabs(
+    #     ["Сохранение", "PostgreSQL", "Концепты", "Аналитика", "Выгрузить граф", "Neo4j"]
+    # )
+    tab_storage, tab_pg, tab_analytics, tab_export, tab_neo = st.tabs(
+        ["Сохранение", "PostgreSQL", "Аналитика", "Выгрузить граф", "Neo4j"]
     )
     with tab_storage:
         render_storage_section()
     with tab_pg:
         render_documents_list_section()
         render_pg_browser_section()
-    with tab_concepts:
-        render_concept_aliases_section()
+    # with tab_concepts:
+    #     render_concept_aliases_section()
     with tab_analytics:
         render_graph_analytics_section()
     with tab_export:
