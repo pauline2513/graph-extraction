@@ -2499,6 +2499,11 @@ def render_graph_analytics_section() -> None:
             "max_out_degree": metrics["max_out_degree"],
             "avg_in_degree": metrics["avg_in_degree"],
             "avg_out_degree": metrics["avg_out_degree"],
+            "fragility_score": metrics.get("fragility_score", 0.0),
+            "articulation_points_count": metrics.get("articulation_points_count", 0),
+            "bridge_edges_count_structural": metrics.get("bridge_edges_count_structural", 0),
+            "max_node_removal_component_gain": metrics.get("max_node_removal_component_gain", 0),
+            "max_node_removal_largest_component_loss": metrics.get("max_node_removal_largest_component_loss", 0.0),
             "bridge_edges_count": metrics.get("bridge_edges_count", 0),
             "components_after_bridges": metrics.get("components_after_bridges", metrics["components_count"]),
             "components_merged_by_bridges": metrics.get("components_merged_by_bridges", 0),
@@ -2509,6 +2514,15 @@ def render_graph_analytics_section() -> None:
         }
     ]
     st.dataframe(pd.DataFrame(metrics_rows), use_container_width=True)
+    st.markdown(
+        """
+\n\n`fragility_score` показывает, насколько граф хрупкий в целом: чем ближе значение к `1`, тем сильнее граф держится на отдельных вершинах и связях.
+\n\n`articulation_points_count` - это число вершин, без которых граф распадается на большее количество частей.
+\n\n`bridge_edges_count_structural` - это число связей-мостов: если такую связь убрать, часть графа может оторваться от остальной структуры.
+\n\n`max_node_removal_component_gain` показывает, на сколько частей максимум может дополнительно распасться граф после удаления одной важной вершины.
+\n\n`max_node_removal_largest_component_loss` показывает, какую долю самой большой компоненты можно потерять при удалении одной важной вершины.
+        """
+    )
 
     table_rows = result.get("table_triplet_rows") or []
     st.caption("Проверка триплетов из таблиц")
@@ -2538,6 +2552,24 @@ def render_graph_analytics_section() -> None:
     if result["degree_rows"]:
         st.caption("Степени вершин")
         st.dataframe(pd.DataFrame(result["degree_rows"][:200]), use_container_width=True)
+
+    if result.get("fragility_rows"):
+        st.caption("Оценка хрупкости графа")
+        st.write(
+            f"\n\nИндекс хрупкости: {metrics.get('fragility_score', 0.0)}. "
+            f"\n\nТочек сочленения: {metrics.get('articulation_points_count', 0)}, "
+            f"\n\nструктурных мостов: {metrics.get('bridge_edges_count_structural', 0)}."
+        )
+        st.write(
+            "В таблице ниже вершины отсортированы по тому, насколько опасно их потерять. "
+            "\n\n`component_gain_if_removed` показывает, на сколько новых частей распадется граф без этой вершины. "
+            "\n\n`largest_component_loss_if_removed` показывает, какая доля крупнейшей компоненты пропадет. "
+            "\n\n`fragility_impact_score` - итоговая локальная оценка риска для конкретной вершины."
+        )
+        st.dataframe(pd.DataFrame(result["fragility_rows"]), use_container_width=True)
+    else:
+        st.caption("Оценка хрупкости графа")
+        st.info("Для пустого графа хрупкость не рассчитывается.")
 
     if result["cycle_rows"]:
         st.caption("Найденные циклы")

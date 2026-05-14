@@ -553,6 +553,94 @@ def compute_pagerank(
     return {node: float(ranks[idx]) for node, idx in node_to_idx.items()}
 
 
+def compute_graph_fragility(graph: nx.DiGraph, pagerank: dict[str, float], limit: int = 50) -> dict[str, Any]:
+    """Estimate how easily the graph breaks when important vertices or edges disappear."""
+    if graph.number_of_nodes() == 0:
+        return {
+            "metrics": {
+                "fragility_score": 0.0,
+                "articulation_points_count": 0,
+                "articulation_points_share": 0.0,
+                "bridge_edges_count_structural": 0,
+                "bridge_edges_share_structural": 0.0,
+                "max_node_removal_component_gain": 0,
+                "max_node_removal_largest_component_loss": 0.0,
+            },
+            "fragility_rows": [],
+        }
+
+    undirected = nx.Graph()
+    for node, attrs in graph.nodes(data=True):
+        undirected.add_node(node, **attrs)
+    undirected.add_edges_from(graph.to_undirected().edges())
+
+    base_components = nx.number_connected_components(undirected)
+    base_largest = max((len(component) for component in nx.connected_components(undirected)), default=0)
+    node_count = undirected.number_of_nodes()
+    edge_count = undirected.number_of_edges()
+
+    articulation_points = set(nx.articulation_points(undirected)) if node_count > 1 else set()
+    bridge_edges = list(nx.bridges(undirected)) if node_count > 1 else []
+
+    fragility_rows: list[dict[str, Any]] = []
+    for node in undirected.nodes:
+        reduced = undirected.copy()
+        reduced.remove_node(node)
+        components_after = nx.number_connected_components(reduced) if reduced.number_of_nodes() else 0
+        largest_after = max((len(component) for component in nx.connected_components(reduced)), default=0)
+        component_gain = max(components_after - base_components, 0)
+        largest_loss = (base_largest - largest_after) / base_largest if base_largest else 0.0
+        total_degree = int(graph.in_degree(node) + graph.out_degree(node))
+        impact_score = (
+            0.45 * min(component_gain / max(base_components, 1), 1.0)
+            + 0.35 * largest_loss
+            + 0.20 * min(total_degree / max(node_count - 1, 1), 1.0)
+        )
+        fragility_rows.append(
+            {
+                "concept_norm": node,
+                "concept_name": graph.nodes[node].get("label", node),
+                "is_articulation_point": node in articulation_points,
+                "component_gain_if_removed": component_gain,
+                "largest_component_loss_if_removed": round(largest_loss, 6),
+                "total_degree": total_degree,
+                "pagerank": round(float(pagerank.get(node, 0.0)), 6),
+                "fragility_impact_score": round(impact_score, 6),
+            }
+        )
+
+    fragility_rows.sort(
+        key=lambda item: (
+            -item["fragility_impact_score"],
+            -int(item["is_articulation_point"]),
+            -item["component_gain_if_removed"],
+            -item["largest_component_loss_if_removed"],
+            -item["total_degree"],
+            item["concept_name"],
+        )
+    )
+
+    articulation_share = len(articulation_points) / node_count if node_count else 0.0
+    bridge_share = len(bridge_edges) / edge_count if edge_count else 0.0
+    max_component_gain = max((row["component_gain_if_removed"] for row in fragility_rows), default=0)
+    max_largest_loss = max((row["largest_component_loss_if_removed"] for row in fragility_rows), default=0.0)
+    top_impact = max((row["fragility_impact_score"] for row in fragility_rows), default=0.0)
+    fragility_score = 0.35 * articulation_share + 0.25 * bridge_share + 0.40 * top_impact
+
+    return {
+        "metrics": {
+            "fragility_score": round(fragility_score, 6),
+            "articulation_points_count": len(articulation_points),
+            "articulation_points_share": round(articulation_share, 6),
+            "bridge_edges_count_structural": len(bridge_edges),
+            "bridge_edges_share_structural": round(bridge_share, 6),
+            "max_node_removal_component_gain": int(max_component_gain),
+            "max_node_removal_largest_component_loss": round(float(max_largest_loss), 6),
+        },
+        "fragility_rows": fragility_rows[:limit],
+    }
+
+
 def fetch_concept_relations(driver) -> list[dict[str, Any]]:
     query = """
     CALL {
@@ -725,6 +813,7 @@ def build_graph_metrics(rel_rows: list[dict[str, Any]]) -> dict[str, Any]:
             node_documents.setdefault(row["target_norm"], set()).add(doc_id)
 
     pagerank = compute_pagerank(graph)
+    fragility_data = compute_graph_fragility(graph, pagerank)
     degree_rows = []
     for node in graph.nodes:
         label = graph.nodes[node].get("label", node)
@@ -816,12 +905,14 @@ def build_graph_metrics(rel_rows: list[dict[str, Any]]) -> dict[str, Any]:
         "max_out_degree": max((row["out_degree"] for row in degree_rows), default=0),
         "avg_in_degree": round(sum(row["in_degree"] for row in degree_rows) / len(degree_rows), 4) if degree_rows else 0.0,
         "avg_out_degree": round(sum(row["out_degree"] for row in degree_rows) / len(degree_rows), 4) if degree_rows else 0.0,
+        **fragility_data["metrics"],
     }
 
     return {
         "graph": graph,
         "metrics": metrics,
         "degree_rows": degree_rows,
+        "fragility_rows": fragility_data["fragility_rows"],
         "cycle_rows": cycle_rows,
         "component_rows": component_rows,
         "global_root": global_root,
@@ -1516,6 +1607,7 @@ def analyze_graph(
         return {
             "metrics": {**graph_data["metrics"], **bridge_metrics, **table_test_data["metrics"]},
             "degree_rows": graph_data["degree_rows"],
+            "fragility_rows": graph_data["fragility_rows"],
             "cycle_rows": graph_data["cycle_rows"],
             "component_rows": graph_data["component_rows"],
             "global_root": graph_data["global_root"],
